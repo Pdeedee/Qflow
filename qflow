@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""qflow - 计算任务工作流管理系统CLI"""
+
+import argparse
+import os
+import subprocess
+import sys
+import signal
+from pathlib import Path
+
+from utils import load_config
+from queue_manager import QueueManager
+
+
+# 存储worker进程ID
+WORKER_PID_FILE = ".worker_pids"
+
+
+def cmd_worker(args):
+    """Worker管理命令"""
+    config = load_config()
+    job_name = config['worker']['job_name']
+
+    if args.action == 'cancel':
+        # 取消所有worker
+        _cancel_workers()
+    elif args.action == 'run':
+        # 直接启动Python worker进程
+        n = args.num if args.num else 1
+        gpu = args.gpu if args.gpu else None
+        mode = args.mode if hasattr(args, 'mode') and args.mode else None
+        _run_workers(n, gpu, args.max_idle, mode)
+    else:
+        # 提交N个worker到SLURM
+        try:
+            n = int(args.action)
+        except ValueError:
+            print(f"无效的参数: {args.action}")
+            print("用法:")
+            print("  qflow worker run [-n N] [-g GPU] [--max-idle SEC]  # 直接启动worker")
+            print("  qflow worker <N>                                   # 提交到SLURM")
+            print("  qflow worker cancel                                # 取消所有worker")
+            return
+
+        _submit_slurm_workers(n, job_name)
+
+
+def _run_workers(n: int, gpu: str, max_idle: int, mode: str = None):
+    """直接启动N个Python worker进程"""
+    print(f"启动 {n} 个worker进程...")
+    if mode:
+        print(f"计算模式: {mode}")
+
+    pids = []
+    for i in range(n):
+        env = os.environ.copy()
+        if gpu:
+            # 分配GPU
+            gpu_list = gpu.split(',')
+            assigned_gpu = gpu_list[i % len(gpu_list)]
+            env['CUDA_VISIBLE_DEVICES'] = assigned_gpu
+            gpu_info = f" (GPU {assigned_gpu})"
+        else:
+            gpu_info = ""
+
+        cmd = [sys.executable, 'worker.py', '--max-idle', str(max_idle)]
+        if mode:
+            cmd.extend(['--mode', mode])
+
+        log_file = open(f'worker_{i}.log', 'w')
+
+        proc = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True
+        )
+        pids.append(proc.pid)
+        print(f"  Worker {i+1}/{n}: PID {proc.pid}{gpu_info}")
+
+    # 保存PID到文件
+    with open(WORKER_PID_FILE, 'w') as f:
+        f.write('\n'.join(map(str, pids)))
+
+    print(f"\n完成，共启动 {n} 个worker")
+    print(f"日志文件: worker_0.log ~ worker_{n-1}.log")
+    print(f"使用 'qflow worker cancel' 停止所有worker")
+
+
+def _cancel_workers():
+    """取消所有worker进程"""
+    if not os.path.exists(WORKER_PID_FILE):
+        print("没有找到运行中的worker")
+        return
+
+    with open(WORKER_PID_FILE, 'r') as f:
+        pids = [int(line.strip()) for line in f if line.strip()]
+
+    killed = 0
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            killed += 1
+            print(f"  已停止 PID {pid}")
+        except ProcessLookupError:
+            print(f"  PID {pid} 已不存在")
+        except PermissionError:
+            print(f"  PID {pid} 无权限停止")
+
+    os.remove(WORKER_PID_FILE)
+    print(f"\n已停止 {killed} 个worker")
+
+
+def _submit_slurm_workers(n: int, job_name: str):
+    """提交N个worker到SLURM"""
+    slurm_script = Path("worker.slurm")
+    if not slurm_script.exists():
+        print("错误: worker.slurm 不存在")
+        print("请创建 worker.slurm 文件，指定SLURM作业参数")
+        print("或使用 'qflow worker run -n N' 直接启动worker")
+        return
+
+    print(f"提交 {n} 个worker作业到SLURM...")
+    for i in range(n):
+        result = subprocess.run(
+            f"sbatch --job-name={job_name} worker.slurm",
+            shell=True,
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0:
+            job_id = result.stdout.strip().split()[-1]
+            print(f"  Worker {i+1}/{n}: 作业ID {job_id}")
+        else:
+            print(f"  Worker {i+1}/{n}: 提交失败 - {result.stderr}")
+
+    print(f"完成，共提交 {n} 个worker")
+
+
+def cmd_manager(args):
+    """Manager管理命令"""
+    if args.action == 'run':
+        from manager import Manager
+        config = load_config()
+        manager = Manager(config)
+        manager.run()
+    else:
+        print(f"未知操作: {args.action}")
+        print("用法: qflow manager run")
+
+
+def cmd_status(args):
+    """显示任务状态"""
+    config = load_config()
+    queue = QueueManager(config)
+
+    stats = queue.get_statistics()
+    failed_tasks = queue.get_failed_tasks(limit=5)
+
+    # 打印表头
+    print("\n================== 任务执行进度 ==================")
+    print(f"{'阶段':<16} {'待处理':>8} {'运行中':>8} {'完成':>8} {'失败':>8}")
+    print("-" * 50)
+
+    # 任务类型显示名称映射
+    type_names = {
+        'opt': '结构优化(opt)',
+        'phonon': '声子计算',
+        'qha': 'QHA计算'
+    }
+
+    total = {'pending': 0, 'running': 0, 'success': 0, 'failed': 0}
+
+    for task_type in ['opt', 'phonon', 'qha']:
+        if task_type in stats:
+            counts = stats[task_type]
+        else:
+            counts = {'pending': 0, 'running': 0, 'success': 0, 'failed': 0}
+
+        name = type_names.get(task_type, task_type)
+        print(f"{name:<16} {counts['pending']:>8} {counts['running']:>8} "
+              f"{counts['success']:>8} {counts['failed']:>8}")
+
+        for status in total:
+            total[status] += counts.get(status, 0)
+
+    print("-" * 50)
+    print(f"{'总计':<16} {total['pending']:>8} {total['running']:>8} "
+          f"{total['success']:>8} {total['failed']:>8}")
+
+    # 显示失败任务
+    if failed_tasks:
+        print("\n最近失败的任务：")
+        for path in failed_tasks:
+            print(f"  - {path}")
+
+    print()
+
+
+def cmd_reset(args):
+    """重置任务状态"""
+    config = load_config()
+    queue = QueueManager(config)
+
+    if args.running:
+        queue.reset_running_tasks()
+        print("已将所有running状态的任务重置为pending")
+    else:
+        print("用法: qflow reset --running")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog='qflow',
+        description='计算任务工作流管理系统',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+示例:
+  qflow manager run                    # 启动Manager进程
+  qflow worker run -n 3 -g "2,3"       # 启动3个worker，使用GPU 2,3
+  qflow worker 10                      # 提交10个worker到SLURM
+  qflow worker cancel                  # 停止所有worker
+  qflow status                         # 查看任务进度
+  qflow reset --running                # 重置running任务为pending
+'''
+    )
+    subparsers = parser.add_subparsers(dest='command', help='子命令')
+
+    # worker子命令
+    parser_worker = subparsers.add_parser(
+        'worker',
+        help='Worker管理',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description='管理Worker进程',
+        epilog='''
+操作类型:
+  run       直接启动Python worker进程（推荐测试使用）
+  cancel    停止所有通过run启动的worker
+  <N>       提交N个worker作业到SLURM（生产环境）
+
+示例:
+  qflow worker run -n 3 -g "2,3" --max-idle 180   # 启动3个worker
+  qflow worker run --mode vasp                     # 使用VASP模式
+  qflow worker 50                                  # 提交50个SLURM作业
+  qflow worker cancel                              # 停止所有worker
+'''
+    )
+    parser_worker.add_argument('action', help='操作: run/cancel/<N>')
+    parser_worker.add_argument('-n', '--num', type=int, default=1,
+                               help='worker数量 (默认: 1)')
+    parser_worker.add_argument('-g', '--gpu', type=str,
+                               help='GPU列表，如 "2,3"，多worker轮流分配')
+    parser_worker.add_argument('--max-idle', type=int, default=120,
+                               help='最大空闲时间(秒)，超时自动退出 (默认: 120)')
+    parser_worker.add_argument('--mode', type=str, choices=['mattersim', 'vasp'],
+                               help='计算模式，覆盖config.yaml设置')
+    parser_worker.set_defaults(func=cmd_worker)
+
+    # manager子命令
+    parser_manager = subparsers.add_parser(
+        'manager',
+        help='Manager管理',
+        description='管理Manager进程，负责任务生成和后处理'
+    )
+    parser_manager.add_argument('action', help='操作: run')
+    parser_manager.set_defaults(func=cmd_manager)
+
+    # status子命令
+    parser_status = subparsers.add_parser(
+        'status',
+        help='查看任务状态',
+        description='显示各阶段任务的执行进度统计'
+    )
+    parser_status.set_defaults(func=cmd_status)
+
+    # reset子命令
+    parser_reset = subparsers.add_parser(
+        'reset',
+        help='重置任务状态',
+        description='重置任务状态，用于故障恢复'
+    )
+    parser_reset.add_argument('--running', action='store_true',
+                              help='将所有running状态的任务重置为pending')
+    parser_reset.set_defaults(func=cmd_reset)
+
+    args = parser.parse_args()
+
+    if args.command is None:
+        parser.print_help()
+        return
+
+    args.func(args)
+
+
+if __name__ == '__main__':
+    main()

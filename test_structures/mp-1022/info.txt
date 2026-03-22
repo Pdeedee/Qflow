@@ -1,0 +1,24 @@
+MP ID: mp-1022
+Formula: K2S
+Space Group: Fm-3m
+Space Group Number: 225
+Energy Above Hull: 0.0 eV/atom
+Formation Energy: -1.247886656770833 eV/atom
+Number of Atoms: 3
+Lattice:
+  a = 5.242404 Å
+  b = 5.242404 Å
+  c = 5.242403 Å
+  alpha = 60.0000°
+  beta = 60.0000°
+  gamma = 60.0000°
+Volume: 101.8771 Å³
+
+--- JANAF Data ---
+JANAF Name: Potassium Sulfide
+ΔfH°(298K): -376.56 kJ/mol
+ΔfG°(298K): -362.745 kJ/mol
+S°(298K): 115.06 J/mol·K
+Cp°(298K): 74.684 J/mol·K
+Match Type: fallback_stable
+QHA Reliability: medium

@@ -1,0 +1,460 @@
+# QFlow - 计算材料学工作流管理系统
+
+## 概述
+
+QFlow 是一个用于管理计算材料学工作流的任务调度系统，支持结构优化、声子计算、QHA（准谐近似）计算的自动化流程管理。支持 MatterSim 和 VASP 两种计算后端，使用 Phonopy 进行声子计算和后处理。
+
+**特点：**
+- 基于 SQLite 数据库的任务队列管理
+- 每个计算任务独立提交 sbatch，充分利用集群资源
+- Manager 进程负责任务调度和后处理
+- 支持 VASP 和 MatterSim 两种计算后端
+- 自动虚频检测和标记
+- 智能超胞生成算法（满足最小原子数和边长约束的最优超胞）
+- 任务优先级：opt > phonon > qha
+- 级联删除机制（重置上游任务时自动删除下游任务）
+
+## 安装
+
+```bash
+# 克隆仓库
+git clone https://github.com/liuzf/qflow.git
+cd qflow
+
+# 安装（推荐使用已有的conda环境）
+pip install -e .
+
+# 验证安装
+qflow --help
+```
+
+## 快速开始
+
+### 1. 准备输入文件
+
+**config.yaml 配置文件：**
+
+```yaml
+# 工作目录
+work_dir: .
+
+# Manager配置
+manager:
+  structures_dir: ./qha_structures    # 结构文件目录
+  scan_interval: 10                   # 扫描间隔（秒）
+  max_workers: 25                     # 最大并发任务数
+
+# Worker配置
+worker:
+  mode: vasp                          # 计算模式: vasp 或 mattersim
+  vasp_cmd: "mpirun vasp_std"         # VASP执行命令
+
+# SLURM配置
+slurm:
+  nodes: 1
+  ntasks_per_node: 32
+  partition: cpu
+  time: "150:00:00"                   # Manager时间限制
+  extra_commands:                      # 环境变量设置
+    - export LD_LIBRARY_PATH=/path/to/libs:$LD_LIBRARY_PATH
+
+# 结构优化配置
+opt:
+  fmax: 0.01                          # 力收敛标准 (eV/Angstrom)
+  refine_structure: true              # 是否在优化前标准化晶格（推荐启用）
+
+# 声子计算配置
+phonon:
+  supercell: null                     # 超胞矩阵，null表示自动计算
+  max_atoms: 300                      # 最大原子数限制
+  min_atoms: 100                      # 最小原子数（确保足够精度）
+  min_length: 10.0                    # 最小边长 (Å)，确保声子收敛
+  displacement_distance: 0.01         # 位移距离 (Angstrom)
+  t_min: 0                            # 热力学性质最低温度 (K)
+  t_max: 1000                         # 热力学性质最高温度 (K)
+  t_step: 10                          # 温度步长 (K)
+
+# QHA计算配置
+qha:
+  volumes: [0.98, 0.99, 1.0, 1.01, 1.02]  # 体积缩放因子
+  pressure: 0                         # 压力 (GPa)
+  t_min: 0                            # 最低温度 (K)
+  t_max: 800                          # 最高温度 (K)
+  t_step: 10                          # 温度步长 (K)
+
+# POTCAR设置
+potcar:
+  functional: PBE_54                  # POTCAR版本: PBE, PBE_52, PBE_54, PBE_64
+
+# VASP INCAR设置（覆盖pymatgen默认值）
+incar:
+  opt:
+    ALGO: Normal
+    EDIFF: 1.0e-07
+    EDIFFG: -1.0e-03
+    IBRION: 1
+    ISIF: 3
+    ISMEAR: 0
+    KSPACING: 0.2
+    LREAL: False
+    NELM: 100
+    NSW: 99
+    PREC: Accurate
+    SIGMA: 0.01
+    NPAR: 4
+  phonon:
+    ALGO: Normal
+    EDIFF: 1.0e-08
+    IBRION: -1
+    ISMEAR: 0
+    LREAL: False
+    NELM: 200
+    NSW: 0
+    PREC: Accurate
+    SIGMA: 0.05
+    LCHARG: False
+    LWAVE: False
+    NPAR: 4
+```
+
+**结构文件目录：**
+
+```bash
+qha_structures/
+├── mp-10172/
+│   └── POSCAR
+├── mp-1022/
+│   └── POSCAR
+└── ...
+```
+
+### 2. 运行
+
+```bash
+# 启动 Manager（提交到 SLURM）
+qflow manager run
+
+# 查看状态
+qflow status
+
+# 查看正在运行的任务详情
+qflow status --running
+```
+
+### 3. 查看进度
+
+```bash
+qflow status
+```
+
+输出示例：
+```
+┌──────────────┬─────────┬─────────┬─────────┬─────────┐
+│ Stage        │ Pending │ Running │ Success │ Failed  │
+├──────────────┼─────────┼─────────┼─────────┼─────────┤
+│ Optimization │       0 │       0 │      93 │       0 │
+│ Phonon       │      23 │       6 │     197 │       0 │
+│ QHA          │     743 │      19 │      26 │       0 │
+├──────────────┼─────────┼─────────┼─────────┼─────────┤
+│ Total        │     766 │      25 │     316 │       0 │
+└──────────────┴─────────┴─────────┴─────────┴─────────┘
+
+⚠ 存在虚频的结构: 34/93
+
+最近6小时平均执行时间:
+  opt: 6.6 min (样本: 20)
+  phonon: 26.1 min (样本: 43)
+  qha: 7.0 min (样本: 26)
+
+预计剩余时间: 3.9 小时 (并发: 25)
+```
+
+### 4. 查看运行中的任务
+
+```bash
+qflow status --running
+```
+
+输出示例：
+```
+正在运行的任务 (25 个):
+====================================================================================================
+Path                                                    Type     Time       SCF Info
+----------------------------------------------------------------------------------------------------
+qha_structures/mp-23162/opt                             opt      8.7 min    ion=8 e=27 rms=0.560E-04
+qha_structures/mp-23240/opt                             opt      8.1 min    ion=6 e=23 rms=0.440E-04
+qha_structures/mp-1434/volume_1.0/task.000000           phonon   8.8 min
+...
+```
+
+- `ion=8`: 已完成8个离子步
+- `e=27`: 当前离子步执行了27个电子步
+- `rms=0.560E-04`: 最后一个电子步的rms值
+
+## 架构
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Manager (SLURM Job)                       │
+│                    qflow manager run                         │
+├─────────────────────────────────────────────────────────────┤
+│  1. 扫描结构目录，生成任务                                    │
+│  2. 按优先级提交 sbatch 任务（opt > phonon > qha）           │
+│  3. 监控任务状态（通过 squeue）                               │
+│  4. 后处理（声子、QHA、虚频检测）                             │
+│  5. 数据库自动备份（每10分钟）                                │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                  SQLite 任务数据库                           │
+│                    tasks.db                                  │
+├─────────────────────────────────────────────────────────────┤
+│  - 任务状态: pending / running / success / failed           │
+│  - 优先级: opt(100) > phonon(50) > qha(30)                  │
+│  - 自动备份: tasks.db.backup                                │
+└─────────────────────────────────────────────────────────────┘
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        ▼                     ▼                     ▼
+┌──────────────┐      ┌──────────────┐      ┌──────────────┐
+│  sbatch job  │      │  sbatch job  │      │  sbatch job  │
+│  (opt task)  │      │(phonon task) │      │ (qha task)   │
+└──────────────┘      └──────────────┘      └──────────────┘
+```
+
+## CLI 命令
+
+```bash
+# Manager 管理
+qflow manager run              # 提交 Manager 到 SLURM
+qflow manager cancel           # 取消 Manager 作业
+
+# 状态查询
+qflow status                   # 查看任务统计
+qflow status --running         # 查看运行中任务详情（按时间排序）
+
+# 任务管理
+qflow cancel                   # 取消所有任务（Manager + 计算任务）
+qflow reset --running          # 重置 running 任务为 pending
+qflow reset --failed           # 重置 failed 任务为 pending
+
+# 任务重新生成（修改配置后使用）
+qflow regen opt                # 重新生成 opt 任务（级联删除 phonon 和 qha）
+qflow regen phonon             # 重新生成 phonon 任务（级联删除 qha）
+qflow regen qha                # 重新生成 qha 任务
+
+# 队列同步
+qflow sync                     # 同步文件系统状态到数据库
+
+# 并发控制
+qflow worker 25                # 设置最大并发任务数为 25
+```
+
+## 计算模式
+
+| 模式 | 说明 | 适用场景 |
+|------|------|----------|
+| `mattersim` | MatterSim机器学习势 | 快速测试、高通量筛选 |
+| `vasp` | VASP第一性原理计算 | 高精度计算 |
+
+```yaml
+# config.yaml
+worker:
+  mode: vasp  # 或 mattersim
+```
+
+## 文件结构
+
+```
+project/
+├── config.yaml               # 配置文件
+├── tasks.db                  # SQLite任务数据库
+├── tasks.db.backup           # 数据库备份
+├── max_workers.txt           # 最大并发数配置（可选）
+├── subs/                     # SLURM脚本目录
+│   └── manager.slurm
+├── log/                      # 日志目录
+│   └── manager_*.log
+│
+└── qha_structures/           # 结构文件
+    ├── mp-10172/
+    │   ├── POSCAR            # 初始结构
+    │   ├── .has_imag         # 虚频标记（如有）
+    │   ├── .phonon_done      # phonon完成标记
+    │   ├── opt/              # 结构优化
+    │   │   ├── POSCAR
+    │   │   ├── CONTCAR       # 优化后结构
+    │   │   └── .success
+    │   ├── volume_1.0/       # 声子计算（平衡体积）
+    │   │   ├── task.000000/
+    │   │   ├── task.000001/
+    │   │   ├── ...
+    │   │   ├── task_perfect/ # 完美超胞（无位移）
+    │   │   └── analyze/
+    │   │       ├── phonopy_disp.yaml
+    │   │       ├── phonopy_params.yaml
+    │   │       ├── thermo_properties.yaml
+    │   │       ├── phonon_band.png
+    │   │       └── phonon_dos.png
+    │   ├── volume_0.98/      # QHA体积点
+    │   ├── volume_0.99/
+    │   ├── volume_1.01/
+    │   ├── volume_1.02/
+    │   └── analyze/          # QHA结果
+    │       ├── pressure_0.00_gibbs-temperature.dat
+    │       ├── pressure_0.00_volume-temperature.dat
+    │       ├── pressure_0.00_bulk_modulus-temperature.dat
+    │       └── ...
+    └── ...
+```
+
+## 任务流程
+
+```
+结构优化 (opt)
+     │
+     ▼
+声子计算 (volume_1.0/task.*)
+     │
+     ▼
+声子后处理 (Phonopy)
+     │
+     ├──→ 创建 .phonon_done 标记
+     │
+     ▼
+虚频检查 ──→ 有虚频：创建 .has_imag，跳过QHA
+     │
+     ▼ 无虚频
+生成其他体积点 (volume_0.98, 0.99, 1.01, 1.02)
+     │
+     ▼
+各体积点声子计算 & 后处理
+     │
+     ▼
+QHA 后处理
+```
+
+## 超胞生成算法
+
+QFlow 使用智能算法生成满足约束的最优超胞：
+
+1. **约束条件**：
+   - `min_atoms`: 最小原子数（默认100），确保声子计算精度
+   - `min_length`: 最小边长（默认10Å），确保声子收敛
+   - `max_atoms`: 最大原子数（默认300），控制计算成本
+
+2. **算法策略**：
+   - 首先满足边长约束，计算每个方向的最小扩胞倍数
+   - 然后逐步增加扩胞倍数，优先增加当前最短边（保持超胞均匀）
+   - 直到满足最小原子数约束
+
+3. **示例**：对于3原子、边长5.28Å的FCC晶胞
+   - 边长约束：`ceil(10/5.28) = 2` → 初始 2×2×2 = 24原子
+   - 原子数不足100，逐步增加到 4×3×3 = 108原子
+   - 最终边长：21.1Å × 15.8Å × 15.8Å
+
+## regen 命令详解
+
+`qflow regen` 命令用于修改配置后重新生成VASP输入文件：
+
+```bash
+# 重新生成 opt 任务
+qflow regen opt
+# - 重新生成所有 opt 目录的 INCAR/KPOINTS/POTCAR
+# - 级联删除所有 volume_* 目录（phonon 和 qha 任务）
+# - 清理 .has_imag 标记
+
+# 重新生成 phonon 任务
+qflow regen phonon
+# - 仅处理 opt 已完成的结构
+# - 如果 volume_1.0 不存在，自动创建新的 phonon 任务
+# - 如果 volume_1.0 存在，重新生成其中的 VASP 输入文件
+# - 级联删除所有 qha 的 volume_* 目录
+# - 清理 .has_imag 和 .phonon_done 标记
+
+# 重新生成 qha 任务
+qflow regen qha
+# - 仅处理 phonon 已完成（.phonon_done）且无虚频的结构
+# - 重新生成所有 volume_* (除了 1.0) 的 VASP 输入文件
+```
+
+## 注意事项
+
+1. **Manager 时间限制**：Manager 作为 SLURM 作业运行，建议设置较长时间（如150小时）
+
+2. **并发控制**：
+   - 通过 `config.yaml` 的 `manager.max_workers` 设置默认值
+   - 运行时可通过 `qflow worker N` 动态调整
+   - 也可直接编辑 `max_workers.txt` 文件
+
+3. **数据库备份**：Manager 每10分钟自动备份数据库到 `tasks.db.backup`
+
+4. **虚频处理**：
+   - 存在虚频的结构会创建 `.has_imag` 标记
+   - 这些结构不会进行 QHA 计算
+   - 使用 `qflow regen opt` 或 `qflow regen phonon` 会清理此标记
+
+5. **故障恢复**：
+   - `qflow reset --running` 重置卡住的任务
+   - `qflow reset --failed` 重置失败任务
+   - 数据库损坏时可从 `tasks.db.backup` 恢复
+
+6. **日志查看**：
+   - Manager日志：`log/manager_*.log`
+   - 任务日志：各任务目录下的 `slurm_*.log`
+
+7. **POTCAR 设置**：
+   - 通过 `potcar.functional` 指定 POTCAR 版本
+   - 支持 `PBE`, `PBE_52`, `PBE_54`, `PBE_64` 等
+
+8. **结构标准化**：
+   - 启用 `opt.refine_structure: true` 会在优化前标准化晶格
+   - 使用 primitive cell 避免不必要的原子数增加
+
+## 依赖
+
+```
+phonopy
+ase
+numpy
+pyyaml
+matplotlib
+pymatgen
+tqdm
+```
+
+## 常见问题
+
+**Q: 任务一直是 running 状态但 squeue 中没有作业？**
+```bash
+qflow cancel        # 取消所有作业并清理 .running 标记
+qflow manager run   # 重新启动 Manager
+```
+
+**Q: 修改了 INCAR 设置，如何让已有任务使用新设置？**
+```bash
+qflow cancel        # 先停止 Manager
+qflow regen opt     # 重新生成 opt 任务（会级联删除 phonon/qha）
+qflow manager run   # 重新启动
+```
+
+**Q: 如何只重新计算某个结构的 phonon？**
+```bash
+# 手动删除该结构的 volume_1.0 目录
+rm -rf qha_structures/mp-xxx/volume_1.0
+rm -f qha_structures/mp-xxx/.phonon_done
+rm -f qha_structures/mp-xxx/.has_imag
+# 然后运行
+qflow regen phonon
+```
+
+**Q: 超胞太大，计算太慢怎么办？**
+调整 `config.yaml` 中的参数：
+```yaml
+phonon:
+  min_atoms: 80       # 降低最小原子数
+  min_length: 8.0     # 降低最小边长
+  max_atoms: 200      # 降低最大原子数
+```
+然后运行 `qflow regen phonon` 重新生成。

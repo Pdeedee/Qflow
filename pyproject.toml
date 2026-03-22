@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qflow"
+version = "0.1.0"
+description = "计算任务工作流管理系统 - 支持MatterSim和VASP的声子/QHA自动化计算"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [
+    {name = "liuzf"}
+]
+keywords = ["phonon", "qha", "vasp", "mattersim", "workflow", "materials science"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+
+dependencies = [
+    "phonopy",
+    "ase",
+    "numpy",
+    "pyyaml",
+    "matplotlib",
+    "pymatgen",
+]
+
+[project.optional-dependencies]
+mattersim = [
+    "mattersim",
+]
+dev = [
+    "pytest",
+]
+
+[project.scripts]
+qflow = "qflow.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/liuzf/qflow"
+
+[tool.setuptools.packages.find]
+where = ["src"]

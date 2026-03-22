@@ -1,0 +1,2 @@
+[console_scripts]
+qflow = qflow.cli:main

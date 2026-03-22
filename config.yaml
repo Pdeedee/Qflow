@@ -1,0 +1,128 @@
+# 计算任务工作流管理系统配置文件
+
+# 工作目录（所有相对路径的基准目录）
+work_dir: .
+
+# Manager配置
+manager:
+  structures_dir: ./qha_structures
+  scan_interval: 10            # 状态扫描间隔（秒）
+  task_timeout: 7200           # 任务超时时间（秒）
+
+# Worker配置
+worker:
+  mode: vasp                    # 计算模式: mattersim 或 vasp
+  vasp_cmd: "/home/share/apps/openmpi-5.0.7/bin/mpirun /home/share/apps/vasp.6.3.2/bin/vasp_std"   # VASP执行命令（使用绝对路径）
+  job_name: "qflow_worker"      # HPC作业名前缀
+
+# SLURM配置
+slurm:
+  # SBATCH header参数
+  nodes: 1
+  ntasks_per_node: 36
+  partition: cpu
+  time: "150:00:00"
+  # 可选参数（取消注释启用）
+  # mem: "64G"
+  # gres: "gpu:1"
+  # account: "your_account"
+  # qos: "normal"
+  # constraint: "cpu"
+  # exclude: "node01,node02"
+
+  # 环境设置
+  # Python 解释器路径（推荐指定绝对路径以避免环境问题）
+  python_path: null                 # null 表示使用当前 Python 解释器，如 "/path/to/conda/envs/myenv/bin/python"
+
+  # Module 系统配置（可选）
+  module_init_script: null          # module 初始化脚本路径，如 "/usr/share/modules/init/bash"
+  modules: []                       # 要加载的模块，如 ["vasp/6.3.2"]
+
+  # 直接设置 VASP 所需的环境变量（替代 module 系统）
+  extra_commands:
+    - export LD_LIBRARY_PATH=/home/share/apps/openmpi-5.0.7/lib:/home/share/apps/scalapack-2.2.2/lib:/home/share/apps/fftw-3.3.10/lib:/home/share/apps/openblas/lib:$LD_LIBRARY_PATH
+
+# 结构优化配置
+opt:
+  fmax: 0.01                    # 力收敛标准 (eV/Angstrom)
+  refine_structure: true        # 是否在优化前标准化晶格（推荐启用，解决对称性数值精度问题）
+
+# 状态文件名
+status_files:
+  running: ".running"
+  success: ".success"
+  failed: ".failed"
+
+# 失败任务记录
+failure:
+  log_file: ./failed_tasks.txt  # 失败任务路径记录文件
+  task_error_file: error.log    # 任务目录下的错误日志文件名
+
+# 任务类型标识
+task_types:
+  opt: "opt"
+  phonon: "phonon"
+  qha: "qha"
+
+# 声子计算配置
+phonon:
+  supercell: null               # 超胞矩阵，null表示自动计算
+  max_atoms: 100                # 最大原子数限制（测试用较小值）
+  displacement_distance: 0.01   # 位移距离 (Angstrom)
+  t_min: 0                      # 热力学性质最低温度 (K)
+  t_max: 1000                   # 热力学性质最高温度 (K)
+  t_step: 10                    # 温度步长 (K)
+
+# QHA计算配置
+qha:
+  volumes: [0.98, 0.99, 1.0, 1.01, 1.02]  # 体积缩放因子
+  pressure: 0                   # 压力 (GPa)
+  t_min: 0                      # 最低温度 (K)
+  t_max: 800                    # 最高温度 (K)
+  t_step: 10                    # 温度步长 (K)
+
+# VASP INCAR设置（仅vasp模式使用）
+# 参考 /home/liuzifeng/data/80relax 的设置
+incar:
+  # 结构优化设置
+  opt:
+    ADDGRID: True           # 额外支撑网格
+    ALGO: Normal            # 算法
+    EDIFF: 1.0e-08          # 电子收敛精度
+    EDIFFG: -1.0e-03        # 力收敛标准 (eV/Angstrom)
+    ENCUT: 520              # 平面波截断能
+    IBRION: 1               # RMM-DIIS 优化算法
+    ISIF: 3                 # 优化晶胞和离子
+    ISMEAR: 0               # 高斯展宽
+    KSPACING: 0.2           # K点间距
+    LASPH: True             # 非球形贡献
+    LCHARG: False           # 不写 CHGCAR
+    LMAXMIX: 6              # 混合截断
+    LREAL: False            # 倒空间投影（高精度）
+    NELM: 100               # 最大电子步数
+    NELMIN: 6               # 最小电子步数
+    NSW: 99                 # 最大离子步数
+    PREC: Accurate          # 高精度
+    SIGMA: 0.01             # 展宽参数
+    SYMPREC: 1.0e-08        # 对称性判断精度（解决晶格不一致问题）
+
+  # 声子计算设置（力常数计算需要极高精度）
+  phonon:
+    ALGO: Normal            # 算法
+    EDIFF: 1.0e-08          # 电子收敛精度
+    ENAUG: 1360             # FFT 增强网格
+    ENCUT: 680              # 更高的平面波截断能
+    GGA: Pe                 # GGA 泛函
+    IBRION: -1              # 单点计算
+    ISMEAR: 0               # 高斯展宽
+    LAECHG: True            # 写出 AE 电荷密度
+    LASPH: True             # 非球形贡献
+    LCHARG: False           # 不写 CHGCAR
+    LMAXMIX: 6              # 混合截断
+    LMIXTAU: True           # 动能密度混合
+    LREAL: False            # 倒空间投影（高精度）
+    NELM: 200               # 更多电子步数
+    NELMIN: 6               # 最小电子步数
+    NSW: 0                  # 不进行离子步
+    PREC: Accurate          # 高精度
+    SIGMA: 0.01             # 展宽参数

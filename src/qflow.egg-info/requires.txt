@@ -1,0 +1,12 @@
+phonopy
+ase
+numpy
+pyyaml
+matplotlib
+pymatgen
+
+[dev]
+pytest
+
+[mattersim]
+mattersim

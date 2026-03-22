@@ -1,0 +1,24 @@
+MP ID: mp-10172
+Formula: Na
+Space Group: P6_3/mmc
+Space Group Number: 194
+Energy Above Hull: 0.0 eV/atom
+Formation Energy: 0.0 eV/atom
+Number of Atoms: 2
+Lattice:
+  a = 3.688771 Å
+  b = 3.688770 Å
+  c = 6.269194 Å
+  alpha = 90.0000°
+  beta = 90.0000°
+  gamma = 120.0000°
+Volume: 73.8764 Å³
+
+--- JANAF Data ---
+JANAF Name: Sodium
+ΔfH°(298K): 0.0 kJ/mol
+ΔfG°(298K): 0.0 kJ/mol
+S°(298K): 51.455 J/mol·K
+Cp°(298K): 28.154 J/mol·K
+Match Type: fallback_stable
+QHA Reliability: medium

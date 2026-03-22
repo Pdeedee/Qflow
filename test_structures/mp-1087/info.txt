@@ -1,0 +1,24 @@
+MP ID: mp-1087
+Formula: SrS
+Space Group: Fm-3m
+Space Group Number: 225
+Energy Above Hull: 0.0 eV/atom
+Formation Energy: -2.42499030140625 eV/atom
+Number of Atoms: 2
+Lattice:
+  a = 4.276606 Å
+  b = 4.276606 Å
+  c = 4.276605 Å
+  alpha = 60.0000°
+  beta = 60.0000°
+  gamma = 60.0000°
+Volume: 55.3073 Å³
+
+--- JANAF Data ---
+JANAF Name: Strontium Sulfide
+ΔfH°(298K): -468.608 kJ/mol
+ΔfG°(298K): -462.842 kJ/mol
+S°(298K): 68.41 J/mol·K
+Cp°(298K): 48.702 J/mol·K
+Match Type: fallback_stable
+QHA Reliability: medium
