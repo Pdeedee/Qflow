@@ -8,3 +8,4 @@ build/
 *.so
 .ipynb_checkpoints/
 *.log
+bte_structures/
