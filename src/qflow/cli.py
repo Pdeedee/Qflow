@@ -2,6 +2,7 @@
 """qflow - 计算任务工作流管理系统CLI"""
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -253,7 +254,7 @@ def cmd_status(args):
         return 'not_ready'
 
     # 收集所有任务
-    all_tasks = {'opt': [], 'phonon': [], 'qha': []}
+    all_tasks = {'opt': [], 'phonon': [], 'qha': [], 'bte': []}
 
     if structures_dir.exists():
         for struct_dir in structures_dir.iterdir():
@@ -278,6 +279,28 @@ def cmd_status(args):
                         task_type = 'qha' if volume_dir.name != 'volume_1.0' else 'phonon'
                         all_tasks[task_type].append({'path': str(task_dir.relative_to(work_dir)), 'status': status})
 
+            # BTE 压强点任务 (P_XXGPa)
+            for pressure_dir in struct_dir.glob('P_*GPa'):
+                # 压强点优化任务
+                bte_opt_dir = pressure_dir / 'opt'
+                if bte_opt_dir.exists():
+                    status = get_task_status(bte_opt_dir)
+                    if status != 'not_ready':
+                        all_tasks['bte'].append({'path': str(bte_opt_dir.relative_to(work_dir)), 'status': status})
+
+                # BTE fc2/fc3 位移任务
+                bte_dir = pressure_dir / 'bte'
+                if bte_dir.exists():
+                    for fc_type in ['fc2', 'fc3']:
+                        fc_dir = bte_dir / fc_type
+                        if fc_dir.exists():
+                            for task_dir in fc_dir.glob('task.*'):
+                                if not task_dir.is_dir() or task_dir.name == 'task_perfect':
+                                    continue
+                                status = get_task_status(task_dir)
+                                if status != 'not_ready':
+                                    all_tasks['bte'].append({'path': str(task_dir.relative_to(work_dir)), 'status': status})
+
     # 如果指定了 --running，显示正在运行的任务
     if hasattr(args, 'show_running') and args.show_running:
         running_tasks = {k: [t for t in v if t['status'] == 'running'] for k, v in all_tasks.items()}
@@ -293,7 +316,8 @@ def cmd_status(args):
         type_names = {
             'opt': 'Optimization',
             'phonon': 'Phonon',
-            'qha': 'QHA'
+            'qha': 'QHA',
+            'bte': 'BTE'
         }
 
         # 从数据库读取运行时间
@@ -371,7 +395,7 @@ def cmd_status(args):
 
         # 收集所有running任务信息并按时间排序
         all_running = []
-        for task_type in ['opt', 'phonon', 'qha']:
+        for task_type in ['opt', 'phonon', 'qha', 'bte']:
             for task in running_tasks[task_type]:
                 task_path = task['path']
                 # 获取运行时间
@@ -402,7 +426,7 @@ def cmd_status(args):
 
         for task in all_running:
             elapsed_str = f"{task['elapsed']:.1f} min" if task['elapsed'] > 0 else "-"
-            type_short = {'opt': 'opt', 'phonon': 'phonon', 'qha': 'qha'}[task['type']]
+            type_short = {'opt': 'opt', 'phonon': 'phonon', 'qha': 'qha', 'bte': 'bte'}[task['type']]
             # 截断路径以适应显示
             path_display = task['path']
             if len(path_display) > 53:
@@ -428,14 +452,15 @@ def cmd_status(args):
     type_names = {
         'opt': 'Optimization',
         'phonon': 'Phonon',
-        'qha': 'QHA'
+        'qha': 'QHA',
+        'bte': 'BTE'
     }
 
     total = {'pending': 0, 'running': 0, 'success': 0, 'failed': 0}
 
     # 收集数据
     rows = []
-    for task_type in ['opt', 'phonon', 'qha']:
+    for task_type in ['opt', 'phonon', 'qha', 'bte']:
         counts = stats.get(task_type, {'pending': 0, 'running': 0, 'success': 0, 'failed': 0})
 
         name = type_names.get(task_type, task_type)
@@ -516,67 +541,64 @@ def cmd_status(args):
 def cmd_cancel(args):
     """取消所有manager和任务"""
     cancelled = 0
+    config = load_config()
+    work_dir = Path(config.get('work_dir', '.')).resolve()
+    jobs_file = work_dir / 'sbatch_jobs.json'
 
     # 1. 取消 manager
     if _cancel_manager():
         cancelled += 1
 
-    # 2. 取消所有任务作业（以opt_/ph_开头的）
-    result = subprocess.run(
-        "squeue -u $USER -o '%.18i %.20j' -h",
-        shell=True,
-        capture_output=True,
-        text=True
-    )
+    # 2. 仅取消当前工作目录下这个 manager 记录过的任务作业
+    job_mapping = {}
+    if jobs_file.exists():
+        try:
+            job_mapping = json.loads(jobs_file.read_text())
+        except Exception:
+            job_mapping = {}
 
-    if result.returncode == 0:
-        lines = result.stdout.strip().split('\n')
-        task_job_ids = []
-        for line in lines:
-            if not line.strip():
-                continue
-            parts = line.split()
-            if len(parts) >= 2:
-                job_id, job_name = parts[0], parts[1]
-                if job_name.startswith('opt_') or job_name.startswith('ph_') or job_name.startswith('qflow_task'):
-                    task_job_ids.append(job_id)
+    task_job_ids = []
+    if job_mapping:
+        result = subprocess.run(
+            "squeue -u $USER -o '%.18i' -h",
+            shell=True,
+            capture_output=True,
+            text=True
+        )
+
+        if result.returncode == 0:
+            active_job_ids = set(result.stdout.strip().split())
+            task_job_ids = [job_id for job_id in job_mapping if job_id in active_job_ids]
 
         if task_job_ids:
-            print(f"找到 {len(task_job_ids)} 个任务作业")
+            print(f"找到当前 manager 提交的 {len(task_job_ids)} 个任务作业")
             for job_id in task_job_ids:
                 subprocess.run(f"scancel {job_id}", shell=True)
                 cancelled += 1
             print(f"  已取消 {len(task_job_ids)} 个任务作业")
+        else:
+            print("没有找到当前 manager 提交且仍在运行的任务作业")
+    else:
+        print(f"没有找到当前工作目录的任务映射文件: {jobs_file}")
 
     if cancelled == 0:
         print("没有找到运行中的任务")
     else:
         print(f"\n总共取消了 {cancelled} 个作业")
 
-    # 清理所有.running标记
-    print("\n清理所有 .running 标记...")
-    config = load_config()
-    work_dir = Path(config.get('work_dir', '.')).resolve()
-    structures_dir = (work_dir / config['manager']['structures_dir']).resolve()
-
+    # 仅清理当前 manager 记录过的任务对应的 .running 标记
+    print("\n清理当前 manager 任务的 .running 标记...")
     cleaned = 0
-    if structures_dir.exists():
-        for struct_dir in structures_dir.iterdir():
-            if not struct_dir.is_dir():
-                continue
+    for rel_path in job_mapping.values():
+        task_dir = work_dir / rel_path
+        running_file = task_dir / '.running'
+        if running_file.exists():
+            running_file.unlink()
+            cleaned += 1
 
-            # opt任务
-            opt_dir = struct_dir / 'opt'
-            if opt_dir.exists() and (opt_dir / '.running').exists():
-                (opt_dir / '.running').unlink()
-                cleaned += 1
-
-            # phonon/qha任务
-            for volume_dir in struct_dir.glob('volume_*'):
-                for task_dir in volume_dir.glob('task.*'):
-                    if task_dir.is_dir() and (task_dir / '.running').exists():
-                        (task_dir / '.running').unlink()
-                        cleaned += 1
+    if job_mapping:
+        remaining_jobs = {job_id: path for job_id, path in job_mapping.items() if job_id not in task_job_ids}
+        jobs_file.write_text(json.dumps(remaining_jobs, indent=2))
 
     if cleaned > 0:
         print(f"  已清理 {cleaned} 个 .running 标记")
@@ -624,6 +646,24 @@ def cmd_reset(args):
                                 (task_dir / '.running').unlink()
                                 count += 1
 
+                # bte压强点任务
+                for pressure_dir in struct_dir.glob('P_*GPa'):
+                    bte_opt_dir = pressure_dir / 'opt'
+                    if bte_opt_dir.exists() and (bte_opt_dir / '.running').exists():
+                        (bte_opt_dir / '.running').unlink()
+                        count += 1
+
+                    bte_dir = pressure_dir / 'bte'
+                    if bte_dir.exists():
+                        for fc_type in ['fc2', 'fc3']:
+                            fc_dir = bte_dir / fc_type
+                            if fc_dir.exists():
+                                for task_dir in fc_dir.glob('task.*'):
+                                    if task_dir.is_dir() and task_dir.name != 'task_perfect':
+                                        if (task_dir / '.running').exists():
+                                            (task_dir / '.running').unlink()
+                                            count += 1
+
         # 更新数据库
         db_count = db.reset_running_tasks()
 
@@ -657,6 +697,30 @@ def cmd_reset(args):
                                 if error_log.exists():
                                     error_log.unlink()
                                 count += 1
+
+                # bte压强点任务
+                for pressure_dir in struct_dir.glob('P_*GPa'):
+                    bte_opt_dir = pressure_dir / 'opt'
+                    if bte_opt_dir.exists() and (bte_opt_dir / '.failed').exists():
+                        (bte_opt_dir / '.failed').unlink()
+                        error_log = bte_opt_dir / 'error.log'
+                        if error_log.exists():
+                            error_log.unlink()
+                        count += 1
+
+                    bte_dir = pressure_dir / 'bte'
+                    if bte_dir.exists():
+                        for fc_type in ['fc2', 'fc3']:
+                            fc_dir = bte_dir / fc_type
+                            if fc_dir.exists():
+                                for task_dir in fc_dir.glob('task.*'):
+                                    if task_dir.is_dir() and task_dir.name != 'task_perfect':
+                                        if (task_dir / '.failed').exists():
+                                            (task_dir / '.failed').unlink()
+                                            error_log = task_dir / 'error.log'
+                                            if error_log.exists():
+                                                error_log.unlink()
+                                            count += 1
 
         # 更新数据库
         db_count = db.reset_failed_tasks()

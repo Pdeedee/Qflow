@@ -597,3 +597,355 @@ def postprocess_qha(struct_dir: str,
         print(f"Warning: Failed to plot QHA figures: {e}")
 
     print(f"QHA后处理完成: {struct_dir}")
+
+
+# ============== BTE (phono3py) 相关函数 ==============
+
+def generate_bte_displacements(atoms: Atoms,
+                               bte_dir: str,
+                               supercell: Optional[Tuple[int, int, int]] = None,
+                               max_atoms: Optional[int] = None,
+                               min_atoms: int = 100,
+                               min_length: float = 10.0,
+                               distance: float = 0.03,
+                               is_plusminus: bool = True,
+                               symprec: float = 1e-3) -> dict:
+    """
+    生成 BTE (phono3py) fc2 + fc3 位移任务
+
+    目录结构:
+        bte_dir/
+        ├── fc2/
+        │   ├── task.000000/POSCAR   # fc2 位移
+        │   ├── ...
+        │   └── task_perfect/POSCAR  # 无位移超胞
+        ├── fc3/
+        │   ├── task.000000/POSCAR   # fc3 位移
+        │   ├── ...
+        │   └── task_perfect/POSCAR
+        └── analyze/
+            └── phono3py_disp.yaml   # phono3py 位移信息
+
+    Args:
+        atoms: 优化后的 ASE atoms 对象
+        bte_dir: BTE 工作目录
+        supercell: 超胞网格，None 则自动计算
+        max_atoms: 最大原子数
+        min_atoms: 最小原子数
+        min_length: 最小边长 (Å)
+        distance: 位移距离 (Å)
+        is_plusminus: 是否使用正负位移
+        symprec: 对称性精度
+
+    Returns:
+        {'n_fc2': int, 'n_fc3': int, 'supercell': tuple, 'n_atoms_sc': int}
+    """
+    from phono3py import Phono3py
+
+    bte_dir = Path(bte_dir)
+    bte_dir.mkdir(parents=True, exist_ok=True)
+
+    if supercell is None:
+        supercell = get_supercell_parameters(
+            atoms,
+            supercell_matrix=None,
+            max_atoms=max_atoms,
+            min_atoms=min_atoms,
+            min_length=min_length
+        )
+
+    sc_matrix = np.diag(supercell) if isinstance(supercell, tuple) else supercell
+
+    phonopy_atoms = ase2phonopy(atoms)
+
+    ph3 = Phono3py(
+        phonopy_atoms,
+        supercell_matrix=sc_matrix,
+        primitive_matrix='auto',
+        phonon_supercell_matrix=sc_matrix,
+        is_symmetry=True,
+        symprec=symprec,
+        is_mesh_symmetry=False,
+        log_level=0,
+    )
+    ph3.generate_displacements(distance=distance, is_plusminus=is_plusminus)
+
+    fc2_supercells = ph3.phonon_supercells_with_displacements
+    fc3_supercells = ph3.supercells_with_displacements
+    n_fc2 = len(fc2_supercells)
+    n_fc3 = len(fc3_supercells)
+
+    # ---- fc2 位移 ----
+    fc2_dir = bte_dir / 'fc2'
+    fc2_dir.mkdir(exist_ok=True)
+
+    # 无位移参考超胞
+    perfect_sc2 = ph3.phonon_supercell
+    _write_phonopy_poscar(perfect_sc2, fc2_dir / 'task_perfect')
+
+    for i, sc in enumerate(fc2_supercells):
+        task_dir = fc2_dir / f'task.{i:06d}'
+        task_dir.mkdir(exist_ok=True)
+        _write_phonopy_poscar(sc, task_dir)
+
+    # ---- fc3 位移 ----
+    fc3_dir = bte_dir / 'fc3'
+    fc3_dir.mkdir(exist_ok=True)
+
+    # 无位移参考超胞
+    perfect_sc3 = ph3.supercell
+    _write_phonopy_poscar(perfect_sc3, fc3_dir / 'task_perfect')
+
+    for i, sc in enumerate(fc3_supercells):
+        task_dir = fc3_dir / f'task.{i:06d}'
+        task_dir.mkdir(exist_ok=True)
+        _write_phonopy_poscar(sc, task_dir)
+
+    # ---- 保存 phono3py 位移信息 ----
+    analyze_dir = bte_dir / 'analyze'
+    analyze_dir.mkdir(exist_ok=True)
+    ph3.save(str(analyze_dir / 'phono3py_disp.yaml'),
+             settings={"force_sets": False, "displacements": True})
+
+    return {
+        'n_fc2': n_fc2,
+        'n_fc3': n_fc3,
+        'supercell': tuple(np.diag(sc_matrix).astype(int)),
+        'n_atoms_sc': len(ph3.supercell),
+    }
+
+
+def _write_phonopy_poscar(phonopy_atoms, task_dir: Path):
+    """将 PhonopyAtoms 写为 POSCAR 到 task_dir/POSCAR"""
+    task_dir = Path(task_dir)
+    task_dir.mkdir(exist_ok=True)
+    atoms = phonopy2ase(phonopy_atoms)
+    write(str(task_dir / 'POSCAR'), atoms, format='vasp', vasp5=True)
+
+
+def collect_bte_forces(bte_dir: str, fc_type: str = 'fc2',
+                       use_vasprun: bool = True) -> List[np.ndarray]:
+    """
+    收集 BTE 位移的力数据
+
+    Args:
+        bte_dir: BTE 工作目录
+        fc_type: 'fc2' 或 'fc3'
+        use_vasprun: 是否从 vasprun.xml 读取
+
+    Returns:
+        力数组列表
+    """
+    fc_dir = Path(bte_dir) / fc_type
+    task_dirs = sorted(fc_dir.glob('task.[0-9]*'))
+    forces = []
+
+    for task_dir in task_dirs:
+        forces_file = task_dir / 'forces.txt'
+        if forces_file.exists():
+            forces.append(np.loadtxt(str(forces_file)))
+        elif use_vasprun:
+            vasprun_file = task_dir / 'vasprun.xml'
+            if vasprun_file.exists():
+                from pymatgen.io.vasp import Vasprun
+                vasprun = Vasprun(str(vasprun_file), parse_dos=False, parse_eigen=False)
+                forces.append(np.array(vasprun.ionic_steps[-1]['forces']))
+            else:
+                raise FileNotFoundError(f"No forces found in {task_dir}")
+        else:
+            raise FileNotFoundError(f"No forces found in {task_dir}")
+
+    return forces
+
+
+def postprocess_bte(bte_dir: str,
+                    tmin: float = 50,
+                    tmax: float = 500,
+                    tstep: float = 50,
+                    method: str = 'RTA',
+                    is_isotope: bool = True,
+                    target_length: float = 60.0,
+                    max_mesh: int = 24,
+                    use_vasprun: bool = True) -> dict:
+    """
+    BTE 后处理：收集力 → 计算力常数 → 计算热导率
+
+    Args:
+        bte_dir: BTE 工作目录
+        tmin, tmax, tstep: 温度范围 (K)
+        method: 'RTA' 或 'LBTE'
+        is_isotope: 是否包含同位素散射
+        target_length: q-mesh 实空间采样长度 (Å)
+        max_mesh: q-mesh 每方向最大值
+        use_vasprun: 是否从 vasprun.xml 读取力
+
+    Returns:
+        {'kappa_300K': float, 'temperatures': list, 'kappa_values': list,
+         'has_imaginary': bool, 'min_freq': float}
+    """
+    from phono3py import Phono3py
+    from phono3py.file_IO import write_fc2_to_hdf5, write_fc3_to_hdf5
+    from phonopy import Phonopy
+
+    bte_dir = Path(bte_dir)
+    analyze_dir = bte_dir / 'analyze'
+
+    # 1. 加载 phono3py 位移信息
+    disp_yaml = analyze_dir / 'phono3py_disp.yaml'
+    if not disp_yaml.exists():
+        raise FileNotFoundError(f"phono3py_disp.yaml not found in {analyze_dir}")
+
+    from phono3py import load as phono3py_load
+    ph3 = phono3py_load(str(disp_yaml), log_level=0)
+
+    # 2. 收集 fc2 力
+    print("Collecting fc2 forces...")
+    fc2_forces = collect_bte_forces(str(bte_dir), 'fc2', use_vasprun=use_vasprun)
+    ph3.phonon_forces = fc2_forces
+    ph3.produce_fc2(symmetrize_fc2=True)
+
+    # 3. 检查虚频
+    print("Checking imaginary frequencies...")
+    phonon = Phonopy(
+        ph3.unitcell,
+        supercell_matrix=ph3.phonon_supercell_matrix,
+        primitive_matrix=ph3.primitive_matrix,
+        is_symmetry=True,
+        symprec=ph3.symmetry.tolerance,
+    )
+    phonon.force_constants = ph3.fc2
+
+    phonon.run_mesh([5, 5, 5])
+    freqs_all = phonon.mesh.frequencies.flatten()
+    min_freq = float(freqs_all.min())
+    has_imaginary = bool(np.any(freqs_all < -0.1))
+
+    # 保存虚频检查结果
+    import json
+    imag_result = {
+        'has_imaginary': has_imaginary,
+        'min_freq_THz': min_freq,
+        'n_imaginary': int(np.sum(freqs_all < -0.1)),
+    }
+    with open(analyze_dir / 'imaginary_check.json', 'w') as f:
+        json.dump(imag_result, f, indent=2)
+
+    if has_imaginary:
+        print(f"WARNING: Structure has imaginary frequencies (min={min_freq:.4f} THz)")
+        # 保存 fc2 并返回
+        write_fc2_to_hdf5(
+            ph3.fc2,
+            p2s_map=ph3.phonon_primitive.p2s_map,
+            physical_unit="eV/angstrom^2",
+            filename=str(analyze_dir / 'fc2.hdf5'),
+        )
+        return {
+            'kappa_300K': None,
+            'temperatures': [],
+            'kappa_values': [],
+            'has_imaginary': True,
+            'min_freq': min_freq,
+        }
+
+    # 4. 收集 fc3 力
+    print("Collecting fc3 forces...")
+    fc3_forces = collect_bte_forces(str(bte_dir), 'fc3', use_vasprun=use_vasprun)
+    ph3.forces = fc3_forces
+    ph3.produce_fc3(symmetrize_fc3r=True)
+
+    # 保存力常数
+    write_fc2_to_hdf5(
+        ph3.fc2,
+        p2s_map=ph3.phonon_primitive.p2s_map,
+        physical_unit="eV/angstrom^2",
+        filename=str(analyze_dir / 'fc2.hdf5'),
+    )
+    write_fc3_to_hdf5(
+        ph3.fc3,
+        p2s_map=ph3.phonon_primitive.p2s_map,
+        filename=str(analyze_dir / 'fc3.hdf5'),
+    )
+
+    # 5. 计算 q-mesh
+    prim_atoms = phonopy2ase(ph3.primitive)
+    lengths = prim_atoms.cell.cellpar()[:3]
+    mesh = []
+    for L in lengths:
+        N = int(np.ceil(target_length / L))
+        N = max(1, min(N, max_mesh))
+        mesh.append(N)
+    # 对称性修正
+    tol = 0.05
+    if abs(lengths[0] - lengths[1]) / max(lengths[0], lengths[1]) < tol:
+        mesh[0] = mesh[1] = max(mesh[0], mesh[1])
+    if (abs(lengths[0] - lengths[1]) / max(lengths[0], lengths[1]) < tol and
+        abs(lengths[1] - lengths[2]) / max(lengths[1], lengths[2]) < tol):
+        mesh[:] = [max(mesh)] * 3
+
+    print(f"Q-mesh: {mesh}")
+
+    # 6. 计算热导率
+    temperatures = np.arange(tmin, tmax + tstep, tstep)
+    ph3.mesh_numbers = mesh
+    ph3.init_phph_interaction(symmetrize_fc3q=False)
+
+    if method.upper() == 'RTA':
+        ph3.run_thermal_conductivity(
+            temperatures=temperatures,
+            is_isotope=is_isotope,
+            write_kappa=True,
+            conductivity_type="wigner"
+        )
+    else:
+        ph3.run_thermal_conductivity(
+            temperatures=temperatures,
+            is_LBTE=True,
+            is_isotope=is_isotope,
+            write_kappa=True,
+            conductivity_type="wigner",
+            boundary_mfp=1e6
+        )
+
+    # 移动 kappa HDF5 到 analyze 目录
+    for kf in Path('.').glob('kappa-*.hdf5'):
+        kf.rename(analyze_dir / kf.name)
+
+    # 7. 提取 kappa 数据
+    tc = ph3.thermal_conductivity
+    kappa_tensor = tc.kappa  # shape: (n_temps, 6) 或 (n_temps, 3, 3)
+    temps = tc.temperatures
+
+    # 提取 xx, yy, zz 分量并取平均
+    if kappa_tensor.ndim == 3:
+        kappa_iso = (kappa_tensor[:, 0, 0] + kappa_tensor[:, 1, 1] + kappa_tensor[:, 2, 2]) / 3.0
+    else:
+        kappa_iso = (kappa_tensor[:, 0] + kappa_tensor[:, 1] + kappa_tensor[:, 2]) / 3.0
+
+    # 找 300K 的 kappa
+    idx_300 = np.argmin(np.abs(temps - 300))
+    kappa_300 = float(kappa_iso[idx_300])
+
+    # 保存 kappa 汇总
+    kappa_file = analyze_dir / 'kappa_summarize.dat'
+    with open(kappa_file, 'w') as f:
+        f.write("# T(K)  kappa_xx  kappa_yy  kappa_zz  kappa_iso\n")
+        for i, T in enumerate(temps):
+            if kappa_tensor.ndim == 3:
+                kxx, kyy, kzz = kappa_tensor[i, 0, 0], kappa_tensor[i, 1, 1], kappa_tensor[i, 2, 2]
+            else:
+                kxx, kyy, kzz = kappa_tensor[i, 0], kappa_tensor[i, 1], kappa_tensor[i, 2]
+            f.write(f"{T:7.1f}  {kxx:10.3f}  {kyy:10.3f}  {kzz:10.3f}  {kappa_iso[i]:10.3f}\n")
+
+    # 保存 phono3py 完整结果
+    ph3.save(str(analyze_dir / 'phono3py_params.yaml'),
+             settings={"force_sets": True, "force_constants": True})
+
+    print(f"BTE post-processing done. kappa(300K) = {kappa_300:.2f} W/mK")
+
+    return {
+        'kappa_300K': kappa_300,
+        'temperatures': temps.tolist(),
+        'kappa_values': kappa_iso.tolist(),
+        'has_imaginary': False,
+        'min_freq': min_freq,
+    }

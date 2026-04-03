@@ -1,0 +1,129 @@
+# BTE 热导率验证计算 - 专用配置
+# 使用 VASP r2SCAN 验证 MatterSim BTE 结果
+
+work_dir: .
+
+manager:
+  structures_dir: ./bte_structures
+  scan_interval: 10
+  task_timeout: 7200
+  qha: false
+  bte: true
+
+worker:
+  mode: vasp
+  vasp_cmd: "mpirun --allow-run-as-root --oversubscribe -np $SLURM_NTASKS vasp_std"
+  job_name: "bte_worker"
+
+slurm:
+  nodes: 1
+  ntasks_per_node: 32
+  partition: slinky
+  time: "24:00:00"
+  task_time: "24:00:00"
+  mem: "64G"
+
+opt:
+  fmax: 0.01
+  refine_structure: true
+
+potcar:
+  functional: PBE_54
+
+status_files:
+  running: ".running"
+  success: ".success"
+  failed: ".failed"
+
+failure:
+  log_file: ./failed_tasks.txt
+  task_error_file: error.log
+
+task_types:
+  opt: "opt"
+  bte_fc2: "bte_fc2"
+  bte_fc3: "bte_fc3"
+
+# 声子配置（BTE 模式不用，但保留避免报错）
+phonon:
+  supercell: null
+  max_atoms: 100
+  displacement_distance: 0.01
+  t_min: 0
+  t_max: 1000
+  t_step: 10
+
+qha:
+  volumes: [0.98, 0.99, 1.0, 1.01, 1.02]
+  pressure: 0
+  t_min: 0
+  t_max: 800
+  t_step: 10
+
+# BTE (phono3py) 配置
+bte:
+  pressures: [0, 10, 20, 30, 40, 50, 60, 70, 80]  # 压强点 (GPa)
+  supercell: null
+  max_atoms: null
+  min_atoms: 100
+  min_length: 10.0
+  displacement_distance: 0.03
+  symprec: 1.0e-03
+  method: RTA
+  is_isotope: true
+  tmin: 50
+  tmax: 500
+  tstep: 50
+  target_length: 60.0
+  max_mesh: 24
+
+# VASP INCAR 设置
+incar:
+  # r2SCAN 结构优化
+  opt:
+    ALGO: Normal
+    EDIFF: 1.0e-07
+    ENCUT: 680
+    ENAUG: 1360
+    IBRION: 2
+    ISIF: 3
+    ISMEAR: 0
+    ISPIN: 1
+    ISTART: 0
+    KSPACING: 0.22
+    LASPH: True
+    LCHARG: False
+    LMAXMIX: 6
+    LMIXTAU: True
+    LREAL: False
+    LWAVE: False
+    METAGGA: R2scan
+    NELM: 200
+    NELMIN: 6
+    NSW: 100
+    PREC: Accurate
+    SIGMA: 0.05
+
+  # r2SCAN 单点（fc2/fc3 位移力计算）
+  phonon:
+    ALGO: Normal
+    EDIFF: 1.0e-08
+    ENCUT: 680
+    ENAUG: 1360
+    IBRION: -1
+    ISMEAR: 0
+    ISPIN: 1
+    ISTART: 0
+    KSPACING: 0.22
+    LASPH: True
+    LCHARG: False
+    LMAXMIX: 6
+    LMIXTAU: True
+    LREAL: False
+    LWAVE: False
+    METAGGA: R2scan
+    NELM: 200
+    NELMIN: 6
+    NSW: 0
+    PREC: Accurate
+    SIGMA: 0.05

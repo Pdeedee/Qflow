@@ -16,8 +16,11 @@ class TaskDB:
     # 任务优先级定义（数字越大优先级越高）
     PRIORITY = {
         'opt': 100,
+        'bte_opt': 90,   # BTE 压强点优化（PSTRESS）
         'qha_opt': 80,   # QHA体积点优化（ISIF=2）
         'phonon': 50,
+        'bte_fc2': 45,   # BTE fc2 位移单点
+        'bte_fc3': 40,   # BTE fc3 位移单点
         'qha': 30
     }
 
@@ -321,9 +324,8 @@ class TaskDB:
                 status = self._get_fs_status(opt_dir)
                 if self.add_task(task_path, 'opt'):
                     synced['added'] += 1
-                if status in ('success', 'failed'):
-                    self.update_status(task_path, status)
-                    synced['updated'] += 1
+                self.update_status(task_path, status)
+                synced['updated'] += 1
 
             # phonon/qha任务
             for volume_dir in struct_dir.glob('volume_*'):
@@ -341,9 +343,8 @@ class TaskDB:
 
                     if self.add_task(task_path, task_type):
                         synced['added'] += 1
-                    if status in ('success', 'failed'):
-                        self.update_status(task_path, status)
-                        synced['updated'] += 1
+                    self.update_status(task_path, status)
+                    synced['updated'] += 1
 
         # 删除不存在的任务
         synced['removed'] = self.remove_nonexistent_tasks(existing_paths)

@@ -8,6 +8,8 @@ manager:
   structures_dir: ./qha_structures
   scan_interval: 10            # 状态扫描间隔（秒）
   task_timeout: 7200           # 任务超时时间（秒）
+  qha: true                    # 开启 QHA 工作流 (opt → phonon → qha)
+  bte: false                   # 开启 BTE 工作流 (opt → fc2+fc3 → 热导率)
 
 # Worker配置
 worker:
@@ -63,6 +65,8 @@ task_types:
   opt: "opt"
   phonon: "phonon"
   qha: "qha"
+  bte_fc2: "bte_fc2"
+  bte_fc3: "bte_fc3"
 
 # 声子计算配置
 phonon:
@@ -126,3 +130,19 @@ incar:
     NSW: 0                  # 不进行离子步
     PREC: Accurate          # 高精度
     SIGMA: 0.01             # 展宽参数
+
+# BTE (phono3py) 热导率计算配置
+bte:
+  supercell: null               # 超胞矩阵，null 表示自动计算
+  max_atoms: null               # 最大原子数，null 按空间群自动设置
+  min_atoms: 100                # 最小原子数
+  min_length: 10.0              # 最小超胞边长 (Å)
+  displacement_distance: 0.03   # 位移距离 (Å)，BTE 推荐 0.03
+  symprec: 1.0e-03              # 对称性精度
+  method: RTA                   # BTE 方法: RTA 或 LBTE
+  is_isotope: true              # 是否包含同位素散射
+  tmin: 50                      # 最低温度 (K)
+  tmax: 500                     # 最高温度 (K)
+  tstep: 50                     # 温度步长 (K)
+  target_length: 60.0           # q-mesh 实空间采样长度 (Å)
+  max_mesh: 24                  # q-mesh 每方向最大值

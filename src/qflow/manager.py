@@ -22,7 +22,9 @@ from .phonon_utils import (
     generate_phonon_displacements,
     postprocess_phonon,
     check_imaginary_frequency,
-    postprocess_qha
+    postprocess_qha,
+    generate_bte_displacements,
+    postprocess_bte,
 )
 
 logger.info("正在加载 pymatgen...")
@@ -68,6 +70,7 @@ class Manager:
         # 声子和QHA配置
         self.phonon_config = config.get('phonon', {})
         self.qha_config = config.get('qha', {})
+        self.bte_config = config.get('bte', {})
 
         # Worker配置
         self.worker_mode = config.get('worker', {}).get('mode', 'mattersim')
@@ -75,6 +78,10 @@ class Manager:
         # 结构优化配置
         opt_config = config.get('opt', {})
         self.refine_structure = opt_config.get('refine_structure', False)
+
+        # 工作流开关: bte: true/false, qha: true/false
+        self.enable_qha = config.get('manager', {}).get('qha', True)
+        self.enable_bte = config.get('manager', {}).get('bte', False)
 
         # INCAR设置在每次提交任务时实时从config.yaml读取（见_generate_vasp_inputs）
 
@@ -94,6 +101,8 @@ class Manager:
         self._qha_generated: Set[str] = set()
         self._phonon_postprocessed: Set[str] = set()
         self._qha_postprocessed: Set[str] = set()
+        self._bte_generated: Set[str] = set()
+        self._bte_postprocessed: Set[str] = set()
 
         logger.info("Manager 初始化完成")
 
@@ -161,6 +170,22 @@ class Manager:
                     for task_dir in volume_dir.glob('task.*'):
                         if task_dir.is_dir():
                             self._extract_task_time(task_dir)
+
+                # 检查BTE任务 (P_XXGPa/opt, P_XXGPa/bte/fc*/task.*)
+                for p_dir in struct_dir.glob('P_*GPa'):
+                    if not p_dir.is_dir():
+                        continue
+                    p_opt = p_dir / 'opt'
+                    if p_opt.exists():
+                        self._extract_task_time(p_opt)
+                    bte_dir = p_dir / 'bte'
+                    if bte_dir.exists():
+                        for fc_type in ['fc2', 'fc3']:
+                            fc_dir = bte_dir / fc_type
+                            if fc_dir.exists():
+                                for task_dir in fc_dir.glob('task.*'):
+                                    if task_dir.is_dir() and task_dir.name != 'task_perfect':
+                                        self._extract_task_time(task_dir)
 
         except Exception as e:
             logger.error(f"同步任务时间失败: {e}")
@@ -280,20 +305,18 @@ class Manager:
                     task_path = str(opt_dir.relative_to(self.work_dir))
                     all_task_paths.add(task_path)
 
-                    # 检查文件系统状态
-                    if (opt_dir / '.success').exists():
-                        self.db.update_status(task_path, 'success')
+                    # 无论任务是否已存在，都要用文件系统状态回写数据库。
+                    if self.db.add_task(task_path, 'opt'):
+                        synced_counts['added'] += 1
+
+                    status = self.get_task_status(opt_dir)
+                    self.db.update_status(task_path, status)
+                    if status == 'success':
                         synced_counts['updated_success'] += 1
-                    elif (opt_dir / '.failed').exists():
-                        self.db.update_status(task_path, 'failed')
+                    elif status == 'failed':
                         synced_counts['updated_failed'] += 1
-                    elif (opt_dir / '.running').exists():
-                        self.db.update_status(task_path, 'running')
+                    elif status == 'running':
                         synced_counts['updated_running'] += 1
-                    else:
-                        # pending状态，添加到队列（如果不存在）
-                        if self.db.add_task(task_path, 'opt'):
-                            synced_counts['added'] += 1
 
                 # 扫描phonon/qha任务
                 for volume_dir in struct_dir.glob('volume_*'):
@@ -309,20 +332,69 @@ class Manager:
                         # 判断任务类型
                         task_type = 'qha' if volume_dir.name != 'volume_1.0' else 'phonon'
 
-                        # 检查文件系统状态
-                        if (task_dir / '.success').exists():
-                            self.db.update_status(task_path, 'success')
+                        if self.db.add_task(task_path, task_type):
+                            synced_counts['added'] += 1
+
+                        status = self.get_task_status(task_dir)
+                        self.db.update_status(task_path, status)
+                        if status == 'success':
                             synced_counts['updated_success'] += 1
-                        elif (task_dir / '.failed').exists():
-                            self.db.update_status(task_path, 'failed')
+                        elif status == 'failed':
                             synced_counts['updated_failed'] += 1
-                        elif (task_dir / '.running').exists():
-                            self.db.update_status(task_path, 'running')
+                        elif status == 'running':
                             synced_counts['updated_running'] += 1
-                        else:
-                            # pending状态
-                            if self.db.add_task(task_path, task_type):
-                                synced_counts['added'] += 1
+
+                # 扫描BTE任务 (P_XXGPa/opt, P_XXGPa/bte/fc2/task.*, P_XXGPa/bte/fc3/task.*)
+                for p_dir in struct_dir.glob('P_*GPa'):
+                    if not p_dir.is_dir():
+                        continue
+
+                    # 压强点 opt 任务
+                    p_opt_dir = p_dir / 'opt'
+                    if p_opt_dir.exists() and (p_opt_dir / 'POSCAR').exists():
+                        task_path = str(p_opt_dir.relative_to(self.work_dir))
+                        all_task_paths.add(task_path)
+
+                        if self.db.add_task(task_path, 'bte_opt'):
+                            synced_counts['added'] += 1
+
+                        status = self.get_task_status(p_opt_dir)
+                        self.db.update_status(task_path, status)
+                        if status == 'success':
+                            synced_counts['updated_success'] += 1
+                        elif status == 'failed':
+                            synced_counts['updated_failed'] += 1
+                        elif status == 'running':
+                            synced_counts['updated_running'] += 1
+
+                    # BTE fc2/fc3 任务
+                    bte_dir = p_dir / 'bte'
+                    if bte_dir.exists():
+                        for fc_type in ['fc2', 'fc3']:
+                            fc_dir = bte_dir / fc_type
+                            if not fc_dir.exists():
+                                continue
+                            bte_task_type = f'bte_{fc_type}'
+                            for task_dir in fc_dir.glob('task.*'):
+                                if not task_dir.is_dir() or task_dir.name == 'task_perfect':
+                                    continue
+                                if not (task_dir / 'POSCAR').exists():
+                                    continue
+
+                                task_path = str(task_dir.relative_to(self.work_dir))
+                                all_task_paths.add(task_path)
+
+                                if self.db.add_task(task_path, bte_task_type):
+                                    synced_counts['added'] += 1
+
+                                status = self.get_task_status(task_dir)
+                                self.db.update_status(task_path, status)
+                                if status == 'success':
+                                    synced_counts['updated_success'] += 1
+                                elif status == 'failed':
+                                    synced_counts['updated_failed'] += 1
+                                elif status == 'running':
+                                    synced_counts['updated_running'] += 1
 
         # 2. 删除队列中不存在的任务
         removed = self.db.remove_nonexistent_tasks(all_task_paths)
@@ -359,31 +431,36 @@ class Manager:
         for task_data in running_tasks:
             task_path_str = task_data['path']
             task_path = self.work_dir / task_path_str
+            slurm_job_id = task_data.get('slurm_job_id', '')
 
             if not task_path.exists():
                 self.db.update_status(task_path_str, 'pending')
+                self._remove_job_mapping(slurm_job_id)
                 reset_to_pending += 1
                 continue
 
             # 检查文件系统状态
             if (task_path / '.success').exists():
                 self.db.update_status(task_path_str, 'success')
+                self._remove_job_mapping(slurm_job_id)
                 synced += 1
             elif (task_path / '.failed').exists():
                 self.db.update_status(task_path_str, 'failed')
+                self._remove_job_mapping(slurm_job_id)
                 synced += 1
             elif not (task_path / '.running').exists():
                 self.db.update_status(task_path_str, 'pending')
+                self._remove_job_mapping(slurm_job_id)
                 reset_to_pending += 1
                 logger.warning(f"任务 {task_path_str} 无运行标记，重置为pending")
             elif active_jobs:
                 # .running存在，检查SLURM job是否还活着
-                slurm_job_id = task_data.get('slurm_job_id', '')
                 if slurm_job_id and slurm_job_id not in active_jobs:
                     # SLURM job已消失但没有.success/.failed，任务异常终止
                     (task_path / '.running').unlink(missing_ok=True)
                     (task_path / '.failed').touch()
                     self.db.update_status(task_path_str, 'failed')
+                    self._remove_job_mapping(slurm_job_id)
                     reset_to_failed += 1
                     logger.warning(f"任务 {task_path_str} SLURM job {slurm_job_id} 已消失，标记为failed")
 
@@ -399,7 +476,7 @@ class Manager:
     def _generate_task_name(self, task_dir: Path) -> str:
         """生成任务名称用于sbatch job-name
 
-        例如: opt_mp-1234, phonon_mp-1234_vol1.0_task001
+        例如: opt_mp-1234, phonon_mp-1234_vol1.0_task001, bte_mp-1234_fc2_t001
         """
         parts = task_dir.parts
 
@@ -412,6 +489,19 @@ class Manager:
 
         if 'opt' in parts:
             return f"opt_{mp_id}" if mp_id else "opt_task"
+
+        # BTE任务
+        if 'bte' in parts:
+            fc_type = None
+            task_num = None
+            for part in parts:
+                if part in ('fc2', 'fc3'):
+                    fc_type = part
+                if part.startswith('task.'):
+                    task_num = part.replace('task.', 't')
+            if mp_id and fc_type and task_num:
+                return f"bte_{mp_id}_{fc_type}_{task_num}"
+            return "bte_task"
 
         # phonon/qha任务
         volume = None
@@ -480,6 +570,20 @@ class Manager:
         jobs[job_id] = str(task_path.relative_to(self.work_dir))
         self.jobs_file.write_text(json.dumps(jobs, indent=2))
 
+    def _remove_job_mapping(self, job_id: str):
+        """移除已结束或失效的 job_id 映射。"""
+        if not job_id or not self.jobs_file.exists():
+            return
+
+        try:
+            jobs = json.loads(self.jobs_file.read_text())
+        except Exception:
+            return
+
+        if job_id in jobs:
+            del jobs[job_id]
+            self.jobs_file.write_text(json.dumps(jobs, indent=2))
+
     def submit_pending_tasks(self):
         """从队列获取pending任务并提交（受max_workers限制）"""
         # 读取最大并发任务数，默认为1
@@ -524,7 +628,12 @@ class Manager:
 
             # 提交前实时生成VASP输入文件（INCAR/POTCAR/KPOINTS）
             task_type = task_data.get('task_type', 'opt')
-            vasp_type = task_type if task_type in ('opt', 'phonon', 'qha_opt') else 'phonon'
+            vasp_type_map = {
+                'opt': 'opt', 'qha_opt': 'qha_opt', 'phonon': 'phonon',
+                'bte_opt': 'bte_opt', 'bte_fc2': 'phonon', 'bte_fc3': 'phonon',
+                'qha': 'phonon',
+            }
+            vasp_type = vasp_type_map.get(task_type, 'phonon')
             if self.worker_mode == 'vasp':
                 try:
                     self._generate_vasp_inputs(task_dir, task_type=vasp_type)
@@ -695,9 +804,11 @@ class Manager:
             task_type: 任务类型
                 - 'opt': 结构优化，使用 MPRelaxSet + ISIF=3
                 - 'qha_opt': QHA体积点优化，使用 MPRelaxSet + ISIF=2
-                - 'phonon': 声子单点计算，使用 MPStaticSet
+                - 'bte_opt': BTE压强点优化，使用 MPRelaxSet + ISIF=3 + PSTRESS
+                - 'phonon': 声子/BTE单点计算，使用 MPStaticSet
         """
         import warnings
+        import re
         warnings.filterwarnings('ignore', category=UserWarning, module='pymatgen')
         warnings.filterwarnings('ignore', category=DeprecationWarning, module='pymatgen')
 
@@ -725,17 +836,27 @@ class Manager:
         structure = PMGStructure.from_file(str(poscar))
 
         if task_type == 'phonon':
-            # 声子计算使用 MPStaticSet（单点计算）
             incar_settings = incar_phonon
             mp_set = MatPESStaticSet(structure, user_incar_settings=incar_settings,
                                     user_potcar_functional=self.potcar_functional)
         elif task_type == 'qha_opt':
-            # QHA体积点优化使用 MPRelaxSet + ISIF=2
             incar_settings = incar_qha_opt
             mp_set = MPRelaxSet(structure, user_incar_settings=incar_settings,
                                user_potcar_functional=self.potcar_functional)
+        elif task_type == 'bte_opt':
+            # BTE 压强优化: ISIF=3 + PSTRESS
+            incar_settings = incar_opt.copy()
+            # 从目录名提取压强: P_XXGPa/opt -> XX GPa -> PSTRESS = XX * 10 (kBar)
+            pressure_gpa = 0
+            for part in task_dir.parts:
+                m = re.match(r'P_(\d+)GPa', part)
+                if m:
+                    pressure_gpa = int(m.group(1))
+                    break
+            incar_settings['PSTRESS'] = pressure_gpa * 10  # GPa -> kBar
+            mp_set = MPRelaxSet(structure, user_incar_settings=incar_settings,
+                               user_potcar_functional=self.potcar_functional)
         else:
-            # 结构优化使用 MPRelaxSet + ISIF=3
             incar_settings = incar_opt
             mp_set = MPRelaxSet(structure, user_incar_settings=incar_settings,
                                user_potcar_functional=self.potcar_functional)
@@ -1051,6 +1172,286 @@ class Manager:
         except Exception as e:
             logger.error(f"  QHA后处理失败 - {e}")
 
+    # ========== BTE 工作流 ==========
+    # 流程: opt(0GPa) → P_XXGPa/opt(带PSTRESS) → fc2 → 虚频检查 → fc3 → BTE后处理
+    # 每个压强点独立: fc2完成后先检查虚频，有虚频则跳过fc3
+
+    def _get_bte_pressures(self):
+        """获取 BTE 压强列表 (GPa)"""
+        return self.bte_config.get('pressures', [0])
+
+    def generate_bte_pressure_opt_tasks(self):
+        """0GPa opt 完成后，为每个压强点生成带 PSTRESS 的 opt 任务"""
+        if not self.enable_bte:
+            return
+
+        logger.info("=== 生成BTE压强优化任务 ===")
+
+        for struct_dir in self.get_all_structures():
+            struct_name = struct_dir.name
+
+            if not self.check_opt_completed(struct_dir):
+                continue
+
+            atoms = self._get_optimized_structure(struct_dir)
+            if atoms is None:
+                continue
+
+            for pressure in self._get_bte_pressures():
+                p_dir = struct_dir / f'P_{pressure:02d}GPa'
+                opt_dir = p_dir / 'opt'
+
+                if opt_dir.exists():
+                    # 确保注册到数据库
+                    task_path = str(opt_dir.relative_to(self.work_dir))
+                    self.db.add_task(task_path, 'bte_opt')
+                    continue
+
+                logger.info(f"  创建 {struct_name} P={pressure}GPa opt 任务")
+                opt_dir.mkdir(parents=True, exist_ok=True)
+
+                # 复制 0GPa 优化后的结构作为起点
+                write(str(opt_dir / 'POSCAR'), atoms, format='vasp', vasp5=True)
+
+                task_path = str(opt_dir.relative_to(self.work_dir))
+                self.db.add_task(task_path, 'bte_opt')
+
+    def generate_bte_tasks(self):
+        """压强 opt 完成后，生成 BTE fc2 位移任务"""
+        if not self.enable_bte:
+            return
+
+        logger.info("=== 生成BTE fc2任务 ===")
+
+        for struct_dir in self.get_all_structures():
+            struct_name = struct_dir.name
+
+            for pressure in self._get_bte_pressures():
+                p_dir = struct_dir / f'P_{pressure:02d}GPa'
+                opt_dir = p_dir / 'opt'
+                bte_dir = p_dir / 'bte'
+
+                # 压强 opt 必须完成
+                if not opt_dir.exists() or self.get_task_status(opt_dir) != 'success':
+                    continue
+
+                cache_key = f"{struct_name}_P{pressure}"
+                if cache_key in self._bte_generated:
+                    continue
+
+                if not bte_dir.exists():
+                    self._prepare_bte_displacements_at_pressure(struct_dir, p_dir)
+
+                if bte_dir.exists():
+                    fc2_dir = bte_dir / 'fc2'
+                    if fc2_dir.exists():
+                        for task_dir in fc2_dir.glob('task.*'):
+                            if task_dir.is_dir() and task_dir.name != 'task_perfect':
+                                task_path = str(task_dir.relative_to(self.work_dir))
+                                self.db.add_task(task_path, 'bte_fc2')
+
+                    self._bte_generated.add(cache_key)
+
+    def generate_bte_fc3_tasks(self):
+        """fc2 完成后检查虚频，无虚频才注册 fc3 任务"""
+        if not self.enable_bte:
+            return
+
+        logger.info("=== 检查虚频并生成BTE fc3任务 ===")
+
+        for struct_dir in self.get_all_structures():
+            struct_name = struct_dir.name
+
+            for pressure in self._get_bte_pressures():
+                p_dir = struct_dir / f'P_{pressure:02d}GPa'
+                bte_dir = p_dir / 'bte'
+
+                if not bte_dir.exists():
+                    continue
+
+                if (bte_dir / '.has_imaginary').exists():
+                    continue
+
+                if (bte_dir / '.fc2_checked').exists():
+                    continue
+
+                if not self._check_fc_completed(bte_dir / 'fc2'):
+                    continue
+
+                logger.info(f"  [BTE] {struct_name} P={pressure}GPa: fc2完成，检查虚频...")
+
+                try:
+                    has_imaginary = self._check_bte_imaginary_at(bte_dir)
+
+                    if has_imaginary:
+                        logger.warning(f"  [BTE] {struct_name} P={pressure}GPa: 存在虚频，跳过fc3")
+                        (bte_dir / '.has_imaginary').touch()
+                        continue
+
+                    logger.info(f"  [BTE] {struct_name} P={pressure}GPa: 无虚频，注册fc3任务")
+                    (bte_dir / '.fc2_checked').touch()
+
+                    fc3_dir = bte_dir / 'fc3'
+                    if fc3_dir.exists():
+                        n_registered = 0
+                        for task_dir in fc3_dir.glob('task.*'):
+                            if task_dir.is_dir() and task_dir.name != 'task_perfect':
+                                task_path = str(task_dir.relative_to(self.work_dir))
+                                if self.db.add_task(task_path, 'bte_fc3'):
+                                    n_registered += 1
+                        logger.info(f"    注册 {n_registered} 个fc3任务")
+
+                except Exception as e:
+                    logger.error(f"  [BTE] 虚频检查失败 {struct_name} P={pressure}GPa: {e}")
+
+    def _prepare_bte_displacements_at_pressure(self, struct_dir: Path, p_dir: Path):
+        """为指定压强点准备 BTE 位移"""
+        struct_name = struct_dir.name
+        pressure = p_dir.name  # e.g. P_10GPa
+
+        opt_dir = p_dir / 'opt'
+        contcar = opt_dir / 'CONTCAR'
+        if contcar.exists() and contcar.stat().st_size > 0:
+            atoms = read(str(contcar))
+        else:
+            atoms = read(str(opt_dir / 'POSCAR'))
+
+        bte_dir = p_dir / 'bte'
+        logger.info(f"  生成BTE位移: {struct_name}/{pressure}")
+
+        try:
+            bte_cfg = self.bte_config
+            info = generate_bte_displacements(
+                atoms=atoms,
+                bte_dir=str(bte_dir),
+                supercell=bte_cfg.get('supercell', None),
+                max_atoms=bte_cfg.get('max_atoms', None),
+                min_atoms=bte_cfg.get('min_atoms', 100),
+                min_length=bte_cfg.get('min_length', 10.0),
+                distance=bte_cfg.get('displacement_distance', 0.03),
+                symprec=bte_cfg.get('symprec', 1e-3),
+            )
+            logger.info(f"    超胞: {info['supercell']}, {info['n_atoms_sc']} atoms")
+            logger.info(f"    fc2: {info['n_fc2']}, fc3: {info['n_fc3']} (待虚频检查)")
+
+        except Exception as e:
+            logger.error(f"  生成BTE位移失败 {struct_name}/{pressure}: {e}")
+
+    def _check_bte_imaginary_at(self, bte_dir: Path) -> bool:
+        """检查指定 bte_dir 的虚频"""
+        import json
+        from phonopy import Phonopy
+        from phono3py import load as phono3py_load
+        import numpy as np
+
+        analyze_dir = bte_dir / 'analyze'
+        ph3 = phono3py_load(str(analyze_dir / 'phono3py_disp.yaml'), log_level=0)
+
+        use_vasprun = (self.worker_mode == 'vasp')
+        from .phonon_utils import collect_bte_forces
+        fc2_forces = collect_bte_forces(str(bte_dir), 'fc2', use_vasprun=use_vasprun)
+        ph3.phonon_forces = fc2_forces
+        ph3.produce_fc2(symmetrize_fc2=True)
+
+        phonon = Phonopy(
+            ph3.unitcell,
+            supercell_matrix=ph3.phonon_supercell_matrix,
+            primitive_matrix=ph3.primitive_matrix,
+            is_symmetry=True,
+            symprec=ph3.symmetry.tolerance,
+        )
+        phonon.force_constants = ph3.fc2
+
+        phonon.run_mesh([5, 5, 5])
+        freqs_all = phonon.mesh.frequencies.flatten()
+        min_freq = float(freqs_all.min())
+        has_imaginary = bool(np.any(freqs_all < -0.1))
+
+        result = {
+            'has_imaginary': has_imaginary,
+            'min_freq_THz': min_freq,
+            'n_imaginary': int(np.sum(freqs_all < -0.1)),
+        }
+        with open(analyze_dir / 'imaginary_check.json', 'w') as f:
+            json.dump(result, f, indent=2)
+
+        logger.info(f"    min_freq={min_freq:.4f} THz, imaginary={has_imaginary}")
+        return has_imaginary
+
+    def _check_fc_completed(self, fc_dir: Path) -> bool:
+        """检查 fc2 或 fc3 目录下所有任务是否完成"""
+        if not fc_dir.exists():
+            return False
+        task_dirs = [d for d in fc_dir.iterdir()
+                     if d.is_dir() and d.name.startswith('task.') and d.name != 'task_perfect']
+        if not task_dirs:
+            return False
+        return all(self.get_task_status(d) == 'success' for d in task_dirs)
+
+    def run_bte_postprocess(self):
+        """BTE 后处理（每个压强点独立）"""
+        if not self.enable_bte:
+            return
+
+        for struct_dir in self.get_all_structures():
+            struct_name = struct_dir.name
+
+            for pressure in self._get_bte_pressures():
+                p_dir = struct_dir / f'P_{pressure:02d}GPa'
+                bte_dir = p_dir / 'bte'
+
+                if not bte_dir.exists():
+                    continue
+
+                cache_key = f"{struct_name}_P{pressure}"
+                if cache_key in self._bte_postprocessed:
+                    continue
+
+                # fc2 + fc3 都完成才做后处理
+                if not (self._check_fc_completed(bte_dir / 'fc2') and
+                        self._check_fc_completed(bte_dir / 'fc3')):
+                    continue
+
+                analyze_dir = bte_dir / 'analyze'
+                if (analyze_dir / 'kappa_summarize.dat').exists():
+                    self._bte_postprocessed.add(cache_key)
+                    continue
+
+                logger.info(f"[BTE POSTPROCESS] {struct_name} P={pressure}GPa ...")
+
+                orig_dir = os.getcwd()
+                try:
+                    bte_cfg = self.bte_config
+                    use_vasprun = (self.worker_mode == 'vasp')
+
+                    os.chdir(str(analyze_dir))
+
+                    result = postprocess_bte(
+                        bte_dir=str(bte_dir),
+                        tmin=bte_cfg.get('tmin', 50),
+                        tmax=bte_cfg.get('tmax', 500),
+                        tstep=bte_cfg.get('tstep', 50),
+                        method=bte_cfg.get('method', 'RTA'),
+                        is_isotope=bte_cfg.get('is_isotope', True),
+                        target_length=bte_cfg.get('target_length', 60.0),
+                        max_mesh=bte_cfg.get('max_mesh', 24),
+                        use_vasprun=use_vasprun,
+                    )
+
+                    os.chdir(orig_dir)
+
+                    if result['has_imaginary']:
+                        logger.warning(f"  {struct_name} P={pressure}GPa: 虚频 (min={result['min_freq']:.4f} THz)")
+                    else:
+                        logger.info(f"  {struct_name} P={pressure}GPa: kappa(300K) = {result['kappa_300K']:.2f} W/mK")
+
+                    (bte_dir / '.bte_done').touch()
+                    self._bte_postprocessed.add(cache_key)
+
+                except Exception as e:
+                    os.chdir(orig_dir)
+                    logger.error(f"  BTE后处理失败 {struct_name} P={pressure}GPa: {e}")
+
     def _print_stats(self, stats: dict):
         """打印统计信息"""
         logger.info("\n--- 当前任务状态 ---")
@@ -1070,7 +1471,7 @@ class Manager:
         logger.info(f"Manager started (Sbatch mode), PID: {os.getpid()}")
         logger.info(f"Structures directory: {self.structures_dir}")
         logger.info(f"Scan interval: {self.scan_interval}s")
-        logger.info(f"Task times directory: {self.task_times_dir}")
+        logger.info(f"Workflows: qha={self.enable_qha}, bte={self.enable_bte}")
 
         # 启动时执行一次完整同步
         self.sync_queue_from_filesystem()
@@ -1081,7 +1482,7 @@ class Manager:
 
         while True:
             try:
-                # 1. 先同步running任务状态（让刚完成的任务从running变成success/failed）
+                # 1. 先同步running任务状态
                 self.sync_running_tasks()
 
                 # 2. 同步任务执行时间
@@ -1089,21 +1490,32 @@ class Manager:
 
                 # 3. 生成各阶段任务目录
                 self.generate_opt_tasks()
-                self.generate_phonon_tasks()
-                self.generate_qha_tasks()
-                self.generate_qha_phonon_tasks()  # 新增：在QHA优化完成后生成声子任务
 
-                # 4. 扫描并提交pending任务（使用最新的running数）
+                if self.enable_qha:
+                    self.generate_phonon_tasks()
+                    self.generate_qha_tasks()
+                    self.generate_qha_phonon_tasks()
+
+                if self.enable_bte:
+                    self.generate_bte_pressure_opt_tasks()
+                    self.generate_bte_tasks()
+                    self.generate_bte_fc3_tasks()
+
+                # 4. 扫描并提交pending任务
                 self.submit_pending_tasks()
 
                 # 5. 执行后处理
-                self.run_postprocess()
+                if self.enable_qha:
+                    self.run_postprocess()
+
+                if self.enable_bte:
+                    self.run_bte_postprocess()
 
                 # 6. 打印统计信息
                 stats = self.collect_statistics()
                 self._print_stats(stats)
 
-                # 7. 定期备份数据库（每10分钟）
+                # 7. 定期备份数据库
                 if time.time() - last_backup_time > backup_interval:
                     if self.db.backup():
                         logger.info("数据库已备份")

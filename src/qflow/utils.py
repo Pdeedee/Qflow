@@ -1,13 +1,16 @@
 """工具函数模块"""
 
 import os
+import re
 import yaml
 from pathlib import Path
 from datetime import datetime
 
 
-def load_config(config_path: str = "config.yaml") -> dict:
-    """加载配置文件"""
+def load_config(config_path: str = None) -> dict:
+    """加载配置文件，优先级: 参数 > 环境变量 QFLOW_CONFIG > config.yaml"""
+    if config_path is None:
+        config_path = os.environ.get('QFLOW_CONFIG', 'config.yaml')
     with open(config_path, 'r', encoding='utf-8') as f:
         return yaml.safe_load(f)
 
@@ -70,30 +73,38 @@ def record_failed_task(task_path: str, config: dict):
 def get_task_type(task_path: str) -> str:
     """
     根据任务路径判断任务类型
-    返回: 'opt', 'qha_opt', 'phonon', 'qha'
+    返回: 'opt', 'qha_opt', 'phonon', 'qha', 'bte_fc2', 'bte_fc3'
     """
     path = Path(task_path)
+    path_str = str(path)
+
+    # BTE 任务
+    if '/bte/fc2/' in path_str and 'task.' in path_str:
+        return 'bte_fc2'
+    if '/bte/fc3/' in path_str and 'task.' in path_str:
+        return 'bte_fc3'
+
+    # BTE 压强点优化: P_XXGPa/opt
+    if re.match(r'.*P_\d+GPa/opt$', path_str):
+        return 'bte_opt'
 
     # 检查是否是QHA体积点的优化任务
-    if 'volume_' in str(path) and path.name == 'opt':
-        # volume_X.XX/opt 是QHA优化任务
-        if 'volume_1.0' not in str(path):
+    if 'volume_' in path_str and path.name == 'opt':
+        if 'volume_1.0' not in path_str:
             return 'qha_opt'
-        # volume_1.0/opt 不应该存在，但如果存在就当作普通opt
         return 'opt'
 
-    if path.name == 'opt' or '/opt' in str(path):
+    if path.name == 'opt' or '/opt' in path_str:
         return 'opt'
 
     # 区分普通声子和QHA声子任务
-    if 'volume_' in str(path) and 'task.' in str(path):
-        # 检查是否是volume_1.0（普通声子）还是其他体积点（QHA）
-        if 'volume_1.0' in str(path):
+    if 'volume_' in path_str and 'task.' in path_str:
+        if 'volume_1.0' in path_str:
             return 'phonon'
         else:
             return 'qha'
 
-    if path.name == 'qha' or '/qha' in str(path):
+    if path.name == 'qha' or '/qha' in path_str:
         return 'qha'
 
     return 'unknown'
