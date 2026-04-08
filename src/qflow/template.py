@@ -243,6 +243,7 @@ if [ $EXIT_CODE -eq 124 ]; then
     echo "ERROR: VASP execution timeout"
     echo "VASP execution timeout after {timeout}s at $(date)" > error.log
     echo "status: timeout" >> .task_time
+    rm -f .running .success
     touch .failed
     exit 1
 elif [ $EXIT_CODE -ne 0 ]; then
@@ -250,11 +251,13 @@ elif [ $EXIT_CODE -ne 0 ]; then
     echo "VASP failed with exit code $EXIT_CODE at $(date)" > error.log
     tail -100 vasp.log >> error.log 2>/dev/null || true
     echo "status: failed" >> .task_time
+    rm -f .running .success
     touch .failed
     exit 1
 else
     echo "SUCCESS: VASP completed successfully"
     echo "status: success" >> .task_time
+    rm -f .running .failed
     touch .success
     exit 0
 fi

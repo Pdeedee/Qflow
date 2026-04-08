@@ -10,7 +10,7 @@ import signal
 import time
 from pathlib import Path
 
-from .utils import load_config
+from .utils import load_config, clear_task_status
 from .template import generate_manager_script
 
 
@@ -148,6 +148,105 @@ def _cancel_manager(config=None):
         return False
 
 
+def _task_type_to_stage(task_type: str) -> str:
+    """将数据库任务类型映射到状态展示阶段。"""
+    if task_type in ('opt',):
+        return 'opt'
+    if task_type in ('phonon',):
+        return 'phonon'
+    if task_type in ('qha_opt', 'qha'):
+        return 'qha'
+    if task_type in ('bte_opt', 'bte_fc2', 'bte_fc3'):
+        return 'bte'
+    return 'other'
+
+
+def _aggregate_statistics(raw_stats):
+    """聚合数据库统计到 CLI 展示阶段。"""
+    aggregated = {
+        'opt': {'pending': 0, 'running': 0, 'success': 0, 'failed': 0},
+        'phonon': {'pending': 0, 'running': 0, 'success': 0, 'failed': 0},
+        'qha': {'pending': 0, 'running': 0, 'success': 0, 'failed': 0},
+        'bte': {'pending': 0, 'running': 0, 'success': 0, 'failed': 0},
+    }
+
+    for task_type, counts in raw_stats.items():
+        stage = _task_type_to_stage(task_type)
+        if stage not in aggregated:
+            continue
+        for status in ('pending', 'running', 'success', 'failed'):
+            aggregated[stage][status] += counts.get(status, 0)
+
+    return aggregated
+
+
+def _remove_job_mappings(work_dir: Path, job_ids):
+    """从当前工作目录的 job 映射文件中移除指定 job。"""
+    jobs_file = work_dir / 'sbatch_jobs.json'
+    if not job_ids or not jobs_file.exists():
+        return
+
+    job_mapping = json.loads(jobs_file.read_text())
+
+    updated = False
+    for job_id in job_ids:
+        if job_id and job_id in job_mapping:
+            del job_mapping[job_id]
+            updated = True
+
+    if updated:
+        jobs_file.write_text(json.dumps(job_mapping, indent=2))
+
+
+def _sync_tracked_running_tasks(config, db, work_dir: Path):
+    """轻量同步：仅检查数据库里 running 的任务。"""
+    running_tasks = db.get_running_tasks()
+    if not running_tasks:
+        return
+
+    active_jobs = set()
+    result = subprocess.run(
+        "squeue -u $USER -o '%.18i' -h",
+        shell=True,
+        capture_output=True,
+        text=True
+    )
+    if result.returncode == 0:
+        active_jobs = set(result.stdout.strip().split())
+
+    stale_job_ids = []
+    failed_status_name = config['status_files']['failed']
+
+    for task_data in running_tasks:
+        task_path = task_data['path']
+        task_dir = work_dir / task_path
+        slurm_job_id = task_data.get('slurm_job_id')
+
+        if not task_dir.exists():
+            db.reset_task_to_pending(task_path)
+            stale_job_ids.append(slurm_job_id)
+            continue
+
+        if (task_dir / config['status_files']['success']).exists():
+            clear_task_status(task_dir, config, statuses=['running'])
+            db.update_status(task_path, 'success')
+            stale_job_ids.append(slurm_job_id)
+        elif (task_dir / failed_status_name).exists():
+            clear_task_status(task_dir, config, statuses=['running'])
+            db.update_status(task_path, 'failed')
+            stale_job_ids.append(slurm_job_id)
+        elif not (task_dir / config['status_files']['running']).exists():
+            db.reset_task_to_pending(task_path)
+            stale_job_ids.append(slurm_job_id)
+        elif active_jobs and slurm_job_id and slurm_job_id not in active_jobs:
+            clear_task_status(task_dir, config, statuses=['running'])
+            (task_dir / failed_status_name).touch()
+            db.update_status(task_path, 'failed')
+            stale_job_ids.append(slurm_job_id)
+
+    _remove_job_mappings(work_dir, stale_job_ids)
+
+
 def cmd_manager(args):
     """Manager管理命令"""
     if args.action == 'run':
@@ -236,75 +335,18 @@ def cmd_manager(args):
 
 
 def cmd_status(args):
-    """显示任务状态 - 直接扫描文件系统"""
+    """显示任务状态 - 基于数据库快速返回"""
     config = load_config()
     work_dir = Path(config.get('work_dir', '.')).resolve()
-    structures_dir = (work_dir / config['manager']['structures_dir']).resolve()
+    from .task_db import TaskDB
 
-    def get_task_status(task_path):
-        """检查任务状态"""
-        if (task_path / '.success').exists():
-            return 'success'
-        if (task_path / '.failed').exists():
-            return 'failed'
-        if (task_path / '.running').exists():
-            return 'running'
-        if (task_path / 'POSCAR').exists():
-            return 'pending'
-        return 'not_ready'
-
-    # 收集所有任务
-    all_tasks = {'opt': [], 'phonon': [], 'qha': [], 'bte': []}
-
-    if structures_dir.exists():
-        for struct_dir in structures_dir.iterdir():
-            if not struct_dir.is_dir():
-                continue
-
-            # opt任务
-            opt_dir = struct_dir / 'opt'
-            if opt_dir.exists():
-                status = get_task_status(opt_dir)
-                if status != 'not_ready':
-                    all_tasks['opt'].append({'path': str(opt_dir.relative_to(work_dir)), 'status': status})
-
-            # phonon/qha任务
-            for volume_dir in struct_dir.glob('volume_*'):
-                for task_dir in volume_dir.glob('task.*'):
-                    if not task_dir.is_dir() or task_dir.name == 'task_perfect':
-                        continue
-
-                    status = get_task_status(task_dir)
-                    if status != 'not_ready':
-                        task_type = 'qha' if volume_dir.name != 'volume_1.0' else 'phonon'
-                        all_tasks[task_type].append({'path': str(task_dir.relative_to(work_dir)), 'status': status})
-
-            # BTE 压强点任务 (P_XXGPa)
-            for pressure_dir in struct_dir.glob('P_*GPa'):
-                # 压强点优化任务
-                bte_opt_dir = pressure_dir / 'opt'
-                if bte_opt_dir.exists():
-                    status = get_task_status(bte_opt_dir)
-                    if status != 'not_ready':
-                        all_tasks['bte'].append({'path': str(bte_opt_dir.relative_to(work_dir)), 'status': status})
-
-                # BTE fc2/fc3 位移任务
-                bte_dir = pressure_dir / 'bte'
-                if bte_dir.exists():
-                    for fc_type in ['fc2', 'fc3']:
-                        fc_dir = bte_dir / fc_type
-                        if fc_dir.exists():
-                            for task_dir in fc_dir.glob('task.*'):
-                                if not task_dir.is_dir() or task_dir.name == 'task_perfect':
-                                    continue
-                                status = get_task_status(task_dir)
-                                if status != 'not_ready':
-                                    all_tasks['bte'].append({'path': str(task_dir.relative_to(work_dir)), 'status': status})
+    db = TaskDB(config)
+    _sync_tracked_running_tasks(config, db, work_dir)
 
     # 如果指定了 --running，显示正在运行的任务
     if hasattr(args, 'show_running') and args.show_running:
-        running_tasks = {k: [t for t in v if t['status'] == 'running'] for k, v in all_tasks.items()}
-        total_running = sum(len(v) for v in running_tasks.values())
+        running_tasks = db.get_running_tasks()
+        total_running = len(running_tasks)
 
         if total_running == 0:
             print("\n没有正在运行的任务")
@@ -314,11 +356,8 @@ def cmd_status(args):
         jobs_file = work_dir / 'sbatch_jobs.json'
         path_to_jobid = {}
         if jobs_file.exists():
-            try:
-                job_mapping = json.loads(jobs_file.read_text())
-                path_to_jobid = {v: k for k, v in job_mapping.items()}
-            except Exception:
-                pass
+            job_mapping = json.loads(jobs_file.read_text())
+            path_to_jobid = {v: k for k, v in job_mapping.items()}
 
         # 从 squeue 获取所有 job 的实时状态（使用缩写：PD/R/CG 等）
         jobid_to_slurm_state = {}
@@ -333,9 +372,7 @@ def cmd_status(args):
                     jobid_to_slurm_state[parts[0].strip()] = parts[1].strip()
 
         # 从数据库读取运行时间
-        from .task_db import TaskDB
         from datetime import datetime
-        db = TaskDB(config)
         now = datetime.now()
 
         def get_scf_info(task_path: str) -> str:
@@ -407,32 +444,26 @@ def cmd_status(args):
 
         # 收集所有running任务信息并按时间排序
         all_running = []
-        for task_type in ['opt', 'phonon', 'qha', 'bte']:
-            for task in running_tasks[task_type]:
-                task_path = task['path']
-                # 获取 job_id 和 SLURM 实时状态
-                job_id = path_to_jobid.get(task_path, '-')
-                slurm_state = jobid_to_slurm_state.get(job_id, '-')
-                # 获取运行时间
-                elapsed_min = 0
-                for task_data in db.get_running_tasks():
-                    if task_data['path'] == task_path:
-                        try:
-                            updated_at = datetime.fromisoformat(task_data.get('updated_at', ''))
-                            elapsed_min = (now - updated_at).total_seconds() / 60
-                        except:
-                            pass
-                        break
-                # 获取SCF信息（优先OSZICAR，回退OUTCAR）
-                scf_info = get_scf_info(task_path)
-                all_running.append({
-                    'path': task_path,
-                    'type': task_type,
-                    'elapsed': elapsed_min,
-                    'scf_info': scf_info,
-                    'job_id': job_id,
-                    'slurm_state': slurm_state,
-                })
+        for task_data in running_tasks:
+            task_path = task_data['path']
+            raw_task_type = task_data.get('task_type', 'unknown')
+            job_id = path_to_jobid.get(task_path, '-')
+            slurm_state = jobid_to_slurm_state.get(job_id, '-')
+            updated_at_str = task_data.get('updated_at')
+            elapsed_min = 0
+            if updated_at_str:
+                updated_at = datetime.fromisoformat(updated_at_str)
+                elapsed_min = (now - updated_at).total_seconds() / 60
+
+            scf_info = get_scf_info(task_path)
+            all_running.append({
+                'path': task_path,
+                'type': raw_task_type,
+                'elapsed': elapsed_min,
+                'scf_info': scf_info,
+                'job_id': job_id,
+                'slurm_state': slurm_state,
+            })
 
         # 按运行时间排序（最长的在前）
         all_running.sort(key=lambda x: x['elapsed'], reverse=True)
@@ -452,18 +483,9 @@ def cmd_status(args):
 
         return
 
-    # 否则显示统计信息
-    stats = {}
-    failed_tasks_list = []
-
-    for task_type, tasks in all_tasks.items():
-        stats[task_type] = {'pending': 0, 'running': 0, 'success': 0, 'failed': 0}
-        for task in tasks:
-            status = task['status']
-            if status in stats[task_type]:
-                stats[task_type][status] += 1
-            if status == 'failed':
-                failed_tasks_list.append(task['path'])
+    raw_stats = db.get_statistics()
+    stats = _aggregate_statistics(raw_stats)
+    failed_tasks_list = [task['path'] for task in db.get_tasks(status='failed', limit=5)]
 
     # 任务类型显示名称映射
     type_names = {
@@ -508,29 +530,24 @@ def cmd_status(args):
             print(f"\n⚠ 存在虚频的结构: {imag_count}/{total_structs}")
 
     # 统计最近完成任务的平均执行时间
-    from .task_db import TaskDB
     from datetime import datetime, timedelta
-    db = TaskDB(config)
     now = datetime.now()
     hours_ago = now - timedelta(hours=6)  # 最近6小时
 
     # 读取最近完成的任务
     avg_times = {}
     for task_data in db.get_recent_completed(hours=6):
-        try:
-            task_type = task_data.get('task_type', 'unknown')
-            if task_type not in avg_times:
-                avg_times[task_type] = []
-            avg_times[task_type].append(task_data['duration_seconds'])
-        except:
-            pass
+        task_type = task_data.get('task_type', 'unknown')
+        if task_type not in avg_times:
+            avg_times[task_type] = []
+        avg_times[task_type].append(task_data['duration_seconds'])
 
     if avg_times:
         print("\n最近6小时平均执行时间:")
         remaining_time = 0
         for task_type, times in avg_times.items():
             avg_min = sum(times) / len(times) / 60
-            pending_count = stats.get(task_type, {}).get('pending', 0)
+            pending_count = raw_stats.get(task_type, {}).get('pending', 0)
             remaining_time += avg_min * pending_count
             print(f"  {task_type}: {avg_min:.1f} min (样本: {len(times)})")
 
@@ -539,10 +556,7 @@ def cmd_status(args):
             max_workers = 1
             max_workers_file = work_dir / 'max_workers.txt'
             if max_workers_file.exists():
-                try:
-                    max_workers = int(max_workers_file.read_text().strip())
-                except:
-                    pass
+                max_workers = int(max_workers_file.read_text().strip())
             estimated_hours = remaining_time / 60 / max_workers
             print(f"\n预计剩余时间: {estimated_hours:.1f} 小时 (并发: {max_workers})")
 
@@ -569,10 +583,7 @@ def cmd_cancel(args):
     # 2. 仅取消当前工作目录下这个 manager 记录过的任务作业
     job_mapping = {}
     if jobs_file.exists():
-        try:
-            job_mapping = json.loads(jobs_file.read_text())
-        except Exception:
-            job_mapping = {}
+        job_mapping = json.loads(jobs_file.read_text())
 
     task_job_ids = []
     if job_mapping:
@@ -622,12 +633,11 @@ def cmd_cancel(args):
 
 
 def cmd_reset(args):
-    """重置任务状态 - 处理文件系统标记和数据库状态"""
+    """重置任务状态 - 基于数据库定位任务并清理对应标记文件"""
     from .task_db import TaskDB
 
     config = load_config()
     work_dir = Path(config.get('work_dir', '.')).resolve()
-    structures_dir = (work_dir / config['manager']['structures_dir']).resolve()
 
     # 检查是否有manager在运行
     running, info = _is_manager_running(config)
@@ -642,105 +652,40 @@ def cmd_reset(args):
     db = TaskDB(config)
 
     if args.running:
-        # 清理所有.running标记
         count = 0
-        if structures_dir.exists():
-            for struct_dir in structures_dir.iterdir():
-                if not struct_dir.is_dir():
-                    continue
-
-                # opt任务
-                opt_dir = struct_dir / 'opt'
-                if opt_dir.exists() and (opt_dir / '.running').exists():
-                    (opt_dir / '.running').unlink()
-                    count += 1
-
-                # phonon/qha任务
-                for volume_dir in struct_dir.glob('volume_*'):
-                    for task_dir in volume_dir.glob('task.*'):
-                        if task_dir.is_dir() and task_dir.name != 'task_perfect':
-                            if (task_dir / '.running').exists():
-                                (task_dir / '.running').unlink()
-                                count += 1
-
-                # bte压强点任务
-                for pressure_dir in struct_dir.glob('P_*GPa'):
-                    bte_opt_dir = pressure_dir / 'opt'
-                    if bte_opt_dir.exists() and (bte_opt_dir / '.running').exists():
-                        (bte_opt_dir / '.running').unlink()
-                        count += 1
-
-                    bte_dir = pressure_dir / 'bte'
-                    if bte_dir.exists():
-                        for fc_type in ['fc2', 'fc3']:
-                            fc_dir = bte_dir / fc_type
-                            if fc_dir.exists():
-                                for task_dir in fc_dir.glob('task.*'):
-                                    if task_dir.is_dir() and task_dir.name != 'task_perfect':
-                                        if (task_dir / '.running').exists():
-                                            (task_dir / '.running').unlink()
-                                            count += 1
+        stale_job_ids = []
+        for task_data in db.get_tasks(status='running'):
+            task_dir = work_dir / task_data['path']
+            if not task_dir.exists():
+                continue
+            removed = clear_task_status(task_dir, config, statuses=['running'])
+            if removed > 0:
+                count += 1
+            stale_job_ids.append(task_data.get('slurm_job_id'))
 
         # 更新数据库
         db_count = db.reset_running_tasks()
+        _remove_job_mappings(work_dir, stale_job_ids)
 
         print(f"已清理 {count} 个 .running 标记")
         print(f"数据库更新: {db_count} 条记录")
 
     elif args.failed:
-        # 清理所有.failed标记
         count = 0
-        if structures_dir.exists():
-            for struct_dir in structures_dir.iterdir():
-                if not struct_dir.is_dir():
-                    continue
-
-                # opt任务
-                opt_dir = struct_dir / 'opt'
-                if opt_dir.exists() and (opt_dir / '.failed').exists():
-                    (opt_dir / '.failed').unlink()
-                    error_log = opt_dir / 'error.log'
-                    if error_log.exists():
-                        error_log.unlink()
-                    count += 1
-
-                # phonon/qha任务
-                for volume_dir in struct_dir.glob('volume_*'):
-                    for task_dir in volume_dir.glob('task.*'):
-                        if task_dir.is_dir() and task_dir.name != 'task_perfect':
-                            if (task_dir / '.failed').exists():
-                                (task_dir / '.failed').unlink()
-                                error_log = task_dir / 'error.log'
-                                if error_log.exists():
-                                    error_log.unlink()
-                                count += 1
-
-                # bte压强点任务
-                for pressure_dir in struct_dir.glob('P_*GPa'):
-                    bte_opt_dir = pressure_dir / 'opt'
-                    if bte_opt_dir.exists() and (bte_opt_dir / '.failed').exists():
-                        (bte_opt_dir / '.failed').unlink()
-                        error_log = bte_opt_dir / 'error.log'
-                        if error_log.exists():
-                            error_log.unlink()
-                        count += 1
-
-                    bte_dir = pressure_dir / 'bte'
-                    if bte_dir.exists():
-                        for fc_type in ['fc2', 'fc3']:
-                            fc_dir = bte_dir / fc_type
-                            if fc_dir.exists():
-                                for task_dir in fc_dir.glob('task.*'):
-                                    if task_dir.is_dir() and task_dir.name != 'task_perfect':
-                                        if (task_dir / '.failed').exists():
-                                            (task_dir / '.failed').unlink()
-                                            error_log = task_dir / 'error.log'
-                                            if error_log.exists():
-                                                error_log.unlink()
-                                            count += 1
+        stale_job_ids = []
+        for task_data in db.get_tasks(status='failed'):
+            task_dir = work_dir / task_data['path']
+            if not task_dir.exists():
+                continue
+            removed = clear_task_status(task_dir, config, statuses=['failed', 'running'],
+                                        remove_error_log=True)
+            if removed > 0:
+                count += 1
+            stale_job_ids.append(task_data.get('slurm_job_id'))
 
         # 更新数据库
         db_count = db.reset_failed_tasks()
+        _remove_job_mappings(work_dir, stale_job_ids)
 
         print(f"已清理 {count} 个 .failed 标记")
         print(f"数据库更新: {db_count} 条记录")

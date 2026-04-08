@@ -5,6 +5,7 @@ import re
 import yaml
 from pathlib import Path
 from datetime import datetime
+from typing import Iterable, Union
 
 
 def load_config(config_path: str = None) -> dict:
@@ -32,6 +33,42 @@ def get_task_status(task_path: str, config: dict) -> str:
     return 'pending'
 
 
+def clear_task_status(task_path: Union[str, Path], config: dict,
+                      statuses: Iterable[str] = None, remove_error_log: bool = False) -> int:
+    """清理任务状态文件。
+
+    Returns:
+        实际删除的状态文件数量。
+    """
+    status_files = config['status_files']
+    task_dir = Path(task_path)
+    statuses = tuple(statuses or ('running', 'success', 'failed'))
+
+    removed = 0
+    for status in statuses:
+        status_name = status_files.get(status)
+        if not status_name:
+            continue
+
+        status_file = task_dir / status_name
+        try:
+            if status_file.exists():
+                status_file.unlink()
+                removed += 1
+        except (FileNotFoundError, PermissionError) as e:
+            print(f"Warning: Failed to remove status file {status_file}: {e}")
+
+    if remove_error_log:
+        error_file = task_dir / config['failure']['task_error_file']
+        try:
+            if error_file.exists():
+                error_file.unlink()
+        except (FileNotFoundError, PermissionError) as e:
+            print(f"Warning: Failed to remove error file {error_file}: {e}")
+
+    return removed
+
+
 def set_task_status(task_path: str, status: str, config: dict, error_msg: str = None):
     """
     设置任务状态
@@ -41,15 +78,7 @@ def set_task_status(task_path: str, status: str, config: dict, error_msg: str = 
     task_dir = Path(task_path)
 
     # 删除旧的状态文件
-    for s in ['running', 'success', 'failed']:
-        status_file = task_dir / status_files[s]
-        try:
-            if status_file.exists():
-                status_file.unlink()
-        except (FileNotFoundError, PermissionError) as e:
-            # 文件可能被其他进程删除或无权限
-            print(f"Warning: Failed to remove status file {status_file}: {e}")
-            pass
+    clear_task_status(task_dir, config, statuses=['running', 'success', 'failed'])
 
     # 创建新的状态文件
     if status in status_files:

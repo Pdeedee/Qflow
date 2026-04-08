@@ -232,6 +232,36 @@ class TaskDB:
             cursor = conn.execute(query, params)
             return [dict(row) for row in cursor]
 
+    def get_tasks_by_prefix(self, path_prefix: str, status: str = None,
+                            task_type: str = None, limit: int = None) -> List[Dict]:
+        """按路径前缀获取任务列表。"""
+        query = 'SELECT * FROM tasks WHERE path LIKE ?'
+        params = [f'{path_prefix}%']
+
+        if status:
+            query += ' AND status = ?'
+            params.append(status)
+        if task_type:
+            query += ' AND task_type = ?'
+            params.append(task_type)
+
+        query += ' ORDER BY updated_at DESC'
+
+        if limit:
+            query += ' LIMIT ?'
+            params.append(limit)
+
+        with self._get_conn() as conn:
+            cursor = conn.execute(query, params)
+            return [dict(row) for row in cursor]
+
+    def get_task(self, task_path: str) -> Optional[Dict]:
+        """获取单个任务"""
+        with self._get_conn() as conn:
+            cursor = conn.execute('SELECT * FROM tasks WHERE path = ?', (task_path,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
     def get_recent_completed(self, hours: int = 6) -> List[Dict]:
         """获取最近完成的任务（用于计算平均时间）"""
         from datetime import timedelta
@@ -251,7 +281,14 @@ class TaskDB:
 
         with self._get_conn() as conn:
             cursor = conn.execute('''
-                UPDATE tasks SET status = 'pending', updated_at = ?
+                UPDATE tasks
+                SET status = 'pending',
+                    updated_at = ?,
+                    start_time = NULL,
+                    end_time = NULL,
+                    duration_seconds = NULL,
+                    slurm_job_id = NULL,
+                    error_message = NULL
                 WHERE status = 'running'
             ''', (now,))
             conn.commit()
@@ -263,7 +300,14 @@ class TaskDB:
 
         with self._get_conn() as conn:
             cursor = conn.execute('''
-                UPDATE tasks SET status = 'pending', updated_at = ?, error_message = NULL
+                UPDATE tasks
+                SET status = 'pending',
+                    updated_at = ?,
+                    start_time = NULL,
+                    end_time = NULL,
+                    duration_seconds = NULL,
+                    slurm_job_id = NULL,
+                    error_message = NULL
                 WHERE status = 'failed'
             ''', (now,))
             conn.commit()
@@ -275,7 +319,14 @@ class TaskDB:
 
         with self._get_conn() as conn:
             cursor = conn.execute('''
-                UPDATE tasks SET status = 'pending', updated_at = ?, error_message = NULL
+                UPDATE tasks
+                SET status = 'pending',
+                    updated_at = ?,
+                    start_time = NULL,
+                    end_time = NULL,
+                    duration_seconds = NULL,
+                    slurm_job_id = NULL,
+                    error_message = NULL
                 WHERE path = ?
             ''', (now, task_path))
             conn.commit()
