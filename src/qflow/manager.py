@@ -18,13 +18,11 @@ logger.info("正在加载 qflow 模块...")
 from .utils import (
     load_config,
     get_structure_name,
-    get_task_type,
-    is_submit_candidate_dir,
-    is_plain_submit_candidate_dir,
     clear_task_status,
 )
 from .template import generate_task_script
 from .task_db import TaskDB
+from .submit_registry import SubmitTaskScanner
 from .phonon_utils import (
     generate_phonon_displacements,
     postprocess_phonon,
@@ -103,6 +101,7 @@ class Manager:
         # SQLite任务数据库
         logger.info("正在初始化任务数据库...")
         self.db = TaskDB(config)
+        self.submit_scanner = SubmitTaskScanner(self.work_dir, self.structures_dir)
 
         # 标记已处理的结构，避免重复
         self._phonon_generated: Set[str] = set()
@@ -386,37 +385,28 @@ class Manager:
 
         return synced_counts
 
-    def _sync_submit_candidates(self, candidate_predicate, scan_name: str):
+    def _scan_submit_candidates(self, plain_only: bool) -> List[Dict]:
+        """快速扫描可提交目录。"""
+        return self.submit_scanner.scan(plain_only=plain_only)
+
+    def _sync_submit_candidates(self, plain_only: bool, scan_name: str):
         """递归扫描可提交目录并同步数据库。"""
         logger.info(f"=== {scan_name} ===")
 
+        records = self._scan_submit_candidates(plain_only)
+        registered_counts = self.db.add_tasks_ignore_existing(records)
         synced_counts = {
-            'added': 0,
+            'added': registered_counts['added'],
             'updated_success': 0,
             'updated_failed': 0,
             'updated_running': 0,
             'removed': 0,
         }
 
-        all_task_paths = set()
-        if not self.structures_dir.exists():
-            return synced_counts
-
-        for task_dir in self.structures_dir.rglob('*'):
-            if not task_dir.is_dir() or not candidate_predicate(task_dir):
-                continue
-            if not (task_dir / 'POSCAR').exists():
-                continue
-
-            task_path = str(task_dir.relative_to(self.work_dir))
-            task_type = get_task_type(task_path)
-            if task_type == 'unknown':
-                task_type = 'plain'
-
-            all_task_paths.add(task_path)
-            if self.db.add_task(task_path, task_type):
-                synced_counts['added'] += 1
-
+        all_task_paths = {record['path'] for record in records}
+        for record in records:
+            task_path = record['path']
+            task_dir = self.work_dir / task_path
             status = self.get_task_status(task_dir)
             self.db.update_status(task_path, status)
             if status == 'success':
@@ -429,7 +419,7 @@ class Manager:
         removed = 0
         for task_data in self.db.get_tasks():
             task_path = task_data['path']
-            if candidate_predicate(task_path) and task_path not in all_task_paths:
+            if self.submit_scanner.is_submit_candidate_name(Path(task_path).name, plain_only) and task_path not in all_task_paths:
                 if self.db.remove_task(task_path):
                     removed += 1
         synced_counts['removed'] = removed
@@ -443,18 +433,47 @@ class Manager:
         )
         return synced_counts
 
+    def _register_submit_candidates(self, plain_only: bool, scan_name: str):
+        """快速扫描可提交目录，只注册新增任务。"""
+        logger.info(f"=== {scan_name} ===")
+
+        registered_counts = self.db.add_tasks_ignore_existing(
+            self._scan_submit_candidates(plain_only)
+        )
+
+        logger.info(
+            f"{scan_name} 完成: "
+            f"新增={registered_counts['added']}, "
+            f"已存在={registered_counts['existing']}"
+        )
+        return registered_counts
+
     def sync_plain_submit_tasks(self):
         """plain_submit 模式：递归扫描所有 task.* 目录并同步数据库。"""
         return self._sync_submit_candidates(
-            is_plain_submit_candidate_dir,
+            True,
             'plain_submit 扫描 task.* 目录'
         )
 
     def sync_all_submit_tasks(self):
         """普通 sync：递归扫描 opt/task.*/task_perfect 并同步数据库。"""
         return self._sync_submit_candidates(
-            is_submit_candidate_dir,
+            False,
             '递归扫描 opt/task.* 目录'
+        )
+
+    def register_plain_submit_tasks(self):
+        """plain_submit 模式：只注册所有 task.* 目录。"""
+        return self._register_submit_candidates(
+            True,
+            'plain_submit 注册 task.* 目录'
+        )
+
+    def register_all_submit_tasks(self):
+        """普通 sync：只注册 opt/task.*/task_perfect。"""
+        return self._register_submit_candidates(
+            False,
+            '递归注册 opt/task.* 目录'
         )
 
     def reconcile_tracked_tasks(self):

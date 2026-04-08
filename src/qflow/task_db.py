@@ -137,14 +137,32 @@ class TaskDB:
             print(f"[DB] 恢复失败: {e}")
         return False
 
-    def add_task(self, task_path: str, task_type: str = None) -> bool:
-        """添加任务，如果已存在则跳过"""
+    def _build_task_insert_row(self, task_path: str, task_type: str = None,
+                               metadata: Dict[str, Optional[str]] = None,
+                               now: str = None):
+        """构造 tasks 表的插入行。"""
         if task_type is None:
             task_type = get_task_type(task_path)
+        if metadata is None:
+            metadata = self._task_metadata(task_path)
+        if now is None:
+            now = datetime.now().isoformat()
 
         priority = self.PRIORITY.get(task_type, 0)
-        now = datetime.now().isoformat()
-        metadata = self._task_metadata(task_path)
+        return (
+            task_path,
+            task_type,
+            metadata['structure_name'],
+            metadata['volume_name'],
+            metadata['pressure_name'],
+            priority,
+            now,
+            now,
+        )
+
+    def add_task(self, task_path: str, task_type: str = None) -> bool:
+        """添加任务，如果已存在则跳过"""
+        row = self._build_task_insert_row(task_path, task_type=task_type)
 
         with self._get_conn() as conn:
             try:
@@ -154,34 +172,66 @@ class TaskDB:
                         status, priority, created_at, updated_at
                     )
                     VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
-                ''', (
-                    task_path,
-                    task_type,
-                    metadata['structure_name'],
-                    metadata['volume_name'],
-                    metadata['pressure_name'],
-                    priority,
-                    now,
-                    now,
-                ))
+                ''', row)
                 conn.commit()
                 return True
             except sqlite3.IntegrityError:
-                conn.execute('''
-                    UPDATE tasks
-                    SET task_type = ?, priority = ?, structure_name = ?,
-                        volume_name = ?, pressure_name = ?
-                    WHERE path = ?
-                ''', (
-                    task_type,
-                    priority,
-                    metadata['structure_name'],
-                    metadata['volume_name'],
-                    metadata['pressure_name'],
-                    task_path,
-                ))
-                conn.commit()
                 return False
+
+    def add_tasks_ignore_existing(self, task_records: List[Dict]) -> Dict[str, int]:
+        """批量添加任务，仅插入新任务，不修改已有记录。"""
+        unique_records = []
+        seen_paths = set()
+        for record in task_records:
+            task_path = record['path']
+            if task_path in seen_paths:
+                continue
+            seen_paths.add(task_path)
+            unique_records.append(record)
+
+        if not unique_records:
+            return {'added': 0, 'existing': 0}
+
+        now = datetime.now().isoformat()
+        rows = []
+        for record in unique_records:
+            task_path = record['path']
+            task_type = record.get('task_type')
+            metadata = {
+                'structure_name': record.get('structure_name'),
+                'volume_name': record.get('volume_name'),
+                'pressure_name': record.get('pressure_name'),
+            }
+            if task_type is None or any(value is None for value in metadata.values()):
+                parsed_metadata = self._task_metadata(task_path)
+                metadata = {
+                    'structure_name': metadata['structure_name'] or parsed_metadata['structure_name'],
+                    'volume_name': metadata['volume_name'] or parsed_metadata['volume_name'],
+                    'pressure_name': metadata['pressure_name'] or parsed_metadata['pressure_name'],
+                }
+
+            rows.append(
+                self._build_task_insert_row(
+                    task_path,
+                    task_type=task_type,
+                    metadata=metadata,
+                    now=now,
+                )
+            )
+
+        with self._get_conn() as conn:
+            before_changes = conn.total_changes
+            conn.executemany('''
+                INSERT OR IGNORE INTO tasks (
+                    path, task_type, structure_name, volume_name, pressure_name,
+                    status, priority, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+            ''', rows)
+            conn.commit()
+
+            added = conn.total_changes - before_changes
+            return {'added': added, 'existing': len(rows) - added}
 
     def get_pending_task(self) -> Optional[Dict]:
         """获取优先级最高的pending任务并标记为running"""

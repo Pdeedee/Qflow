@@ -966,18 +966,23 @@ def cmd_regen(args):
 
 
 def cmd_sync(args):
-    """同步任务队列（扫描文件系统并更新队列状态）"""
+    """快速同步任务队列（只注册新增任务，不逐项回写状态）"""
     print("=== QFlow 队列同步 ===\n")
 
     config = load_config()
     running, info = _is_manager_running(config)
     work_dir = Path(config.get('work_dir', '.')).resolve()
 
-    from .manager import Manager
+    from .task_db import TaskDB
+    from .submit_registry import SubmitTaskScanner
 
     def run_sync_once():
-        manager = Manager(config)
-        return manager.sync_all_submit_tasks()
+        db = TaskDB(config)
+        structures_dir = (work_dir / config['manager']['structures_dir']).resolve()
+        plain_submit = config.get('manager', {}).get('plain_submit', False)
+        scanner = SubmitTaskScanner(work_dir, structures_dir)
+        synced_counts = db.add_tasks_ignore_existing(scanner.scan(plain_only=plain_submit))
+        return db, synced_counts
 
     if running:
         # manager 在运行，先停掉再重启
@@ -988,7 +993,7 @@ def cmd_sync(args):
         time.sleep(2)
 
         print("执行队列同步...\n")
-        synced_counts = run_sync_once()
+        db, synced_counts = run_sync_once()
 
         # 重新启动 manager（启动时会自动同步）
         print("重新启动 Manager...")
@@ -999,20 +1004,15 @@ def cmd_sync(args):
     else:
         # manager 没有运行，直接同步
         print("Manager未运行，执行队列同步...\n")
-        synced_counts = run_sync_once()
-
-    manager = Manager(config)
+        db, synced_counts = run_sync_once()
 
     # 显示同步结果
     print("\n同步完成！")
     print(f"  新增任务: {synced_counts['added']}")
-    print(f"  更新为success: {synced_counts['updated_success']}")
-    print(f"  更新为failed: {synced_counts['updated_failed']}")
-    print(f"  更新为running: {synced_counts['updated_running']}")
-    print(f"  删除过期任务: {synced_counts['removed']}")
+    print(f"  已存在任务: {synced_counts['existing']}")
 
     # 显示队列统计
-    stats = manager.db.get_statistics()
+    stats = db.get_statistics()
     print(f"\n当前数据库状态:")
     for task_type, counts in stats.items():
         print(f"  {task_type}: pending={counts['pending']}, running={counts['running']}, "
