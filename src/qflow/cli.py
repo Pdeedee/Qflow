@@ -310,15 +310,27 @@ def cmd_status(args):
             print("\n没有正在运行的任务")
             return
 
-        print(f"\n正在运行的任务 ({total_running} 个):")
-        print("=" * 100)
+        # 读取 sbatch_jobs.json 构建 path -> job_id 反向映射
+        jobs_file = work_dir / 'sbatch_jobs.json'
+        path_to_jobid = {}
+        if jobs_file.exists():
+            try:
+                job_mapping = json.loads(jobs_file.read_text())
+                path_to_jobid = {v: k for k, v in job_mapping.items()}
+            except Exception:
+                pass
 
-        type_names = {
-            'opt': 'Optimization',
-            'phonon': 'Phonon',
-            'qha': 'QHA',
-            'bte': 'BTE'
-        }
+        # 从 squeue 获取所有 job 的实时状态（使用缩写：PD/R/CG 等）
+        jobid_to_slurm_state = {}
+        result = subprocess.run(
+            "squeue -u $USER -o '%.18i %.2t' -h",
+            shell=True, capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            for line in result.stdout.strip().splitlines():
+                parts = line.split()
+                if len(parts) >= 2:
+                    jobid_to_slurm_state[parts[0].strip()] = parts[1].strip()
 
         # 从数据库读取运行时间
         from .task_db import TaskDB
@@ -398,6 +410,9 @@ def cmd_status(args):
         for task_type in ['opt', 'phonon', 'qha', 'bte']:
             for task in running_tasks[task_type]:
                 task_path = task['path']
+                # 获取 job_id 和 SLURM 实时状态
+                job_id = path_to_jobid.get(task_path, '-')
+                slurm_state = jobid_to_slurm_state.get(job_id, '-')
                 # 获取运行时间
                 elapsed_min = 0
                 for task_data in db.get_running_tasks():
@@ -414,24 +429,26 @@ def cmd_status(args):
                     'path': task_path,
                     'type': task_type,
                     'elapsed': elapsed_min,
-                    'scf_info': scf_info
+                    'scf_info': scf_info,
+                    'job_id': job_id,
+                    'slurm_state': slurm_state,
                 })
 
         # 按运行时间排序（最长的在前）
         all_running.sort(key=lambda x: x['elapsed'], reverse=True)
 
         # 打印表头
-        print(f"{'Path':<55} {'Type':<8} {'Time':<10} {'SCF Info':<25}")
-        print("-" * 100)
+        print(f"\n正在运行的任务 ({total_running} 个):")
+        print("=" * 120)
+        print(f"{'JobID':<10} {'ST':<5} {'Path':<55} {'Type':<8} {'Time':<10} {'SCF Info':<25}")
+        print("-" * 120)
 
         for task in all_running:
             elapsed_str = f"{task['elapsed']:.1f} min" if task['elapsed'] > 0 else "-"
-            type_short = {'opt': 'opt', 'phonon': 'phonon', 'qha': 'qha', 'bte': 'bte'}[task['type']]
-            # 截断路径以适应显示
             path_display = task['path']
             if len(path_display) > 53:
                 path_display = "..." + path_display[-50:]
-            print(f"{path_display:<55} {type_short:<8} {elapsed_str:<10} {task['scf_info']:<25}")
+            print(f"{task['job_id']:<10} {task['slurm_state']:<5} {path_display:<55} {task['type']:<8} {elapsed_str:<10} {task['scf_info']:<25}")
 
         return
 
