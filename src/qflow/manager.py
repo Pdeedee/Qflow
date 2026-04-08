@@ -15,7 +15,14 @@ logger.info("正在加载 ASE...")
 from ase.io import read, write
 
 logger.info("正在加载 qflow 模块...")
-from .utils import load_config, get_structure_name, get_task_type, clear_task_status
+from .utils import (
+    load_config,
+    get_structure_name,
+    get_task_type,
+    is_submit_candidate_dir,
+    is_plain_submit_candidate_dir,
+    clear_task_status,
+)
 from .template import generate_task_script
 from .task_db import TaskDB
 from .phonon_utils import (
@@ -379,9 +386,9 @@ class Manager:
 
         return synced_counts
 
-    def sync_plain_submit_tasks(self):
-        """plain_submit 模式：递归扫描所有 task.* 目录并同步数据库。"""
-        logger.info("=== plain_submit 扫描 task.* 目录 ===")
+    def _sync_submit_candidates(self, candidate_predicate, scan_name: str):
+        """递归扫描可提交目录并同步数据库。"""
+        logger.info(f"=== {scan_name} ===")
 
         synced_counts = {
             'added': 0,
@@ -395,8 +402,8 @@ class Manager:
         if not self.structures_dir.exists():
             return synced_counts
 
-        for task_dir in self.structures_dir.rglob('task.*'):
-            if not task_dir.is_dir() or task_dir.name == 'task_perfect':
+        for task_dir in self.structures_dir.rglob('*'):
+            if not task_dir.is_dir() or not candidate_predicate(task_dir):
                 continue
             if not (task_dir / 'POSCAR').exists():
                 continue
@@ -422,12 +429,12 @@ class Manager:
         removed = 0
         for task_data in self.db.get_tasks():
             task_path = task_data['path']
-            if Path(task_path).name.startswith('task.') and task_path not in all_task_paths:
+            if candidate_predicate(task_path) and task_path not in all_task_paths:
                 if self.db.remove_task(task_path):
                     removed += 1
         synced_counts['removed'] = removed
         logger.info(
-            "plain_submit 同步完成: "
+            f"{scan_name} 完成: "
             f"新增={synced_counts['added']}, "
             f"success={synced_counts['updated_success']}, "
             f"failed={synced_counts['updated_failed']}, "
@@ -435,6 +442,20 @@ class Manager:
             f"删除={synced_counts['removed']}"
         )
         return synced_counts
+
+    def sync_plain_submit_tasks(self):
+        """plain_submit 模式：递归扫描所有 task.* 目录并同步数据库。"""
+        return self._sync_submit_candidates(
+            is_plain_submit_candidate_dir,
+            'plain_submit 扫描 task.* 目录'
+        )
+
+    def sync_all_submit_tasks(self):
+        """普通 sync：递归扫描 opt/task.*/task_perfect 并同步数据库。"""
+        return self._sync_submit_candidates(
+            is_submit_candidate_dir,
+            '递归扫描 opt/task.* 目录'
+        )
 
     def reconcile_tracked_tasks(self):
         """启动恢复：仅回写数据库中已跟踪任务的文件系统状态。"""

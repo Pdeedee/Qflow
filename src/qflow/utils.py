@@ -106,11 +106,12 @@ def get_task_type(task_path: str) -> str:
     """
     path = Path(task_path)
     path_str = str(path)
+    is_task_dir = path.name.startswith('task.') or path.name == 'task_perfect'
 
     # BTE 任务
-    if '/bte/fc2/' in path_str and 'task.' in path_str:
+    if '/bte/fc2/' in path_str and is_task_dir:
         return 'bte_fc2'
-    if '/bte/fc3/' in path_str and 'task.' in path_str:
+    if '/bte/fc3/' in path_str and is_task_dir:
         return 'bte_fc3'
 
     # BTE 压强点优化: P_XXGPa/opt
@@ -127,7 +128,7 @@ def get_task_type(task_path: str) -> str:
         return 'opt'
 
     # 区分普通声子和QHA声子任务
-    if 'volume_' in path_str and 'task.' in path_str:
+    if 'volume_' in path_str and is_task_dir:
         if 'volume_1.0' in path_str:
             return 'phonon'
         else:
@@ -137,6 +138,17 @@ def get_task_type(task_path: str) -> str:
         return 'qha'
 
     return 'unknown'
+
+
+def is_submit_candidate_dir(path: Union[str, Path]) -> bool:
+    """判断目录是否是可直接提交/跟踪的任务目录。"""
+    name = Path(path).name
+    return name == 'opt' or name == 'task_perfect' or name.startswith('task.')
+
+
+def is_plain_submit_candidate_dir(path: Union[str, Path]) -> bool:
+    """plain_submit 模式下的任务目录，仅包含 task.*。"""
+    return Path(path).name.startswith('task.')
 
 
 def parse_task_metadata(task_path: str, config: dict) -> dict:

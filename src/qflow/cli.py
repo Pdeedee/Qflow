@@ -971,6 +971,13 @@ def cmd_sync(args):
 
     config = load_config()
     running, info = _is_manager_running(config)
+    work_dir = Path(config.get('work_dir', '.')).resolve()
+
+    from .manager import Manager
+
+    def run_sync_once():
+        manager = Manager(config)
+        return manager.sync_all_submit_tasks()
 
     if running:
         # manager 在运行，先停掉再重启
@@ -980,9 +987,11 @@ def cmd_sync(args):
         print()
         time.sleep(2)
 
+        print("执行队列同步...\n")
+        synced_counts = run_sync_once()
+
         # 重新启动 manager（启动时会自动同步）
         print("重新启动 Manager...")
-        work_dir = Path(config.get('work_dir', '.')).resolve()
         subprocess.run(
             [sys.executable, '-m', 'qflow.cli', 'manager', 'run'],
             cwd=work_dir
@@ -990,27 +999,26 @@ def cmd_sync(args):
     else:
         # manager 没有运行，直接同步
         print("Manager未运行，执行队列同步...\n")
+        synced_counts = run_sync_once()
 
-        from .manager import Manager
+    manager = Manager(config)
 
-        manager = Manager(config)
-        synced_counts = manager.sync_plain_submit_tasks()
+    # 显示同步结果
+    print("\n同步完成！")
+    print(f"  新增任务: {synced_counts['added']}")
+    print(f"  更新为success: {synced_counts['updated_success']}")
+    print(f"  更新为failed: {synced_counts['updated_failed']}")
+    print(f"  更新为running: {synced_counts['updated_running']}")
+    print(f"  删除过期任务: {synced_counts['removed']}")
 
-        # 显示同步结果
-        print("\n同步完成！")
-        print(f"  新增任务: {synced_counts['added']}")
-        print(f"  更新为success: {synced_counts['updated_success']}")
-        print(f"  更新为failed: {synced_counts['updated_failed']}")
-        print(f"  更新为running: {synced_counts['updated_running']}")
-        print(f"  删除过期任务: {synced_counts['removed']}")
+    # 显示队列统计
+    stats = manager.db.get_statistics()
+    print(f"\n当前数据库状态:")
+    for task_type, counts in stats.items():
+        print(f"  {task_type}: pending={counts['pending']}, running={counts['running']}, "
+              f"success={counts['success']}, failed={counts['failed']}")
 
-        # 显示队列统计
-        stats = manager.db.get_statistics()
-        print(f"\n当前数据库状态:")
-        for task_type, counts in stats.items():
-            print(f"  {task_type}: pending={counts['pending']}, running={counts['running']}, "
-                  f"success={counts['success']}, failed={counts['failed']}")
-
+    if not running:
         print("\n提示: 使用 'qflow manager run' 启动 Manager")
 
 
