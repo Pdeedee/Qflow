@@ -15,7 +15,7 @@ logger.info("正在加载 ASE...")
 from ase.io import read, write
 
 logger.info("正在加载 qflow 模块...")
-from .utils import load_config, get_structure_name, clear_task_status
+from .utils import load_config, get_structure_name, get_task_type, clear_task_status
 from .template import generate_task_script
 from .task_db import TaskDB
 from .phonon_utils import (
@@ -82,6 +82,7 @@ class Manager:
         # 工作流开关: bte: true/false, qha: true/false
         self.enable_qha = config.get('manager', {}).get('qha', True)
         self.enable_bte = config.get('manager', {}).get('bte', False)
+        self.plain_submit = config.get('manager', {}).get('plain_submit', False)
 
         # INCAR设置在每次提交任务时实时从config.yaml读取（见_generate_vasp_inputs）
 
@@ -378,6 +379,63 @@ class Manager:
 
         return synced_counts
 
+    def sync_plain_submit_tasks(self):
+        """plain_submit 模式：递归扫描所有 task.* 目录并同步数据库。"""
+        logger.info("=== plain_submit 扫描 task.* 目录 ===")
+
+        synced_counts = {
+            'added': 0,
+            'updated_success': 0,
+            'updated_failed': 0,
+            'updated_running': 0,
+            'removed': 0,
+        }
+
+        all_task_paths = set()
+        if not self.structures_dir.exists():
+            return synced_counts
+
+        for task_dir in self.structures_dir.rglob('task.*'):
+            if not task_dir.is_dir() or task_dir.name == 'task_perfect':
+                continue
+            if not (task_dir / 'POSCAR').exists():
+                continue
+
+            task_path = str(task_dir.relative_to(self.work_dir))
+            task_type = get_task_type(task_path)
+            if task_type == 'unknown':
+                task_type = 'plain'
+
+            all_task_paths.add(task_path)
+            if self.db.add_task(task_path, task_type):
+                synced_counts['added'] += 1
+
+            status = self.get_task_status(task_dir)
+            self.db.update_status(task_path, status)
+            if status == 'success':
+                synced_counts['updated_success'] += 1
+            elif status == 'failed':
+                synced_counts['updated_failed'] += 1
+            elif status == 'running':
+                synced_counts['updated_running'] += 1
+
+        removed = 0
+        for task_data in self.db.get_tasks():
+            task_path = task_data['path']
+            if Path(task_path).name.startswith('task.') and task_path not in all_task_paths:
+                if self.db.remove_task(task_path):
+                    removed += 1
+        synced_counts['removed'] = removed
+        logger.info(
+            "plain_submit 同步完成: "
+            f"新增={synced_counts['added']}, "
+            f"success={synced_counts['updated_success']}, "
+            f"failed={synced_counts['updated_failed']}, "
+            f"running={synced_counts['updated_running']}, "
+            f"删除={synced_counts['removed']}"
+        )
+        return synced_counts
+
     def reconcile_tracked_tasks(self):
         """启动恢复：仅回写数据库中已跟踪任务的文件系统状态。"""
         logger.info("=== 恢复已跟踪任务状态 ===")
@@ -650,7 +708,7 @@ class Manager:
             vasp_type_map = {
                 'opt': 'opt', 'qha_opt': 'qha_opt', 'phonon': 'phonon',
                 'bte_opt': 'bte_opt', 'bte_fc2': 'phonon', 'bte_fc3': 'phonon',
-                'qha': 'phonon',
+                'qha': 'phonon', 'plain': 'phonon',
             }
             vasp_type = vasp_type_map.get(task_type, 'phonon')
             if self.worker_mode == 'vasp':
@@ -1469,9 +1527,12 @@ class Manager:
         logger.info(f"Structures directory: {self.structures_dir}")
         logger.info(f"Scan interval: {self.scan_interval}s")
         logger.info(f"Workflows: qha={self.enable_qha}, bte={self.enable_bte}")
+        logger.info(f"Plain submit: {self.plain_submit}")
 
         # 启动时仅恢复数据库中已跟踪任务的状态，不做全量目录扫描
         self.reconcile_tracked_tasks()
+        if self.plain_submit:
+            self.sync_plain_submit_tasks()
 
         # 备份计时器
         last_backup_time = time.time()
@@ -1484,28 +1545,32 @@ class Manager:
             # 2. 同步任务执行时间
             self.sync_task_times()
 
-            # 3. 生成各阶段任务目录
-            self.generate_opt_tasks()
+            # 3. 任务准备
+            if self.plain_submit:
+                self.sync_plain_submit_tasks()
+            else:
+                self.generate_opt_tasks()
 
-            if self.enable_qha:
-                self.generate_phonon_tasks()
-                self.generate_qha_tasks()
-                self.generate_qha_phonon_tasks()
+                if self.enable_qha:
+                    self.generate_phonon_tasks()
+                    self.generate_qha_tasks()
+                    self.generate_qha_phonon_tasks()
 
-            if self.enable_bte:
-                self.generate_bte_pressure_opt_tasks()
-                self.generate_bte_tasks()
-                self.generate_bte_fc3_tasks()
+                if self.enable_bte:
+                    self.generate_bte_pressure_opt_tasks()
+                    self.generate_bte_tasks()
+                    self.generate_bte_fc3_tasks()
 
             # 4. 扫描并提交pending任务
             self.submit_pending_tasks()
 
             # 5. 执行后处理
-            if self.enable_qha:
-                self.run_postprocess()
+            if not self.plain_submit:
+                if self.enable_qha:
+                    self.run_postprocess()
 
-            if self.enable_bte:
-                self.run_bte_postprocess()
+                if self.enable_bte:
+                    self.run_bte_postprocess()
 
             # 6. 打印统计信息
             stats = self.collect_statistics()

@@ -139,6 +139,35 @@ def get_task_type(task_path: str) -> str:
     return 'unknown'
 
 
+def parse_task_metadata(task_path: str, config: dict) -> dict:
+    """从任务路径提取结构、体积和压强元数据。"""
+    path = Path(task_path)
+    parts = path.parts
+
+    structures_dir = Path(config['manager']['structures_dir'])
+    structures_parts = structures_dir.parts
+
+    structure_name = None
+    if len(parts) > len(structures_parts) and parts[:len(structures_parts)] == structures_parts:
+        structure_name = parts[len(structures_parts)]
+    elif parts:
+        structure_name = parts[0]
+
+    volume_name = None
+    pressure_name = None
+    for part in parts:
+        if part.startswith('volume_'):
+            volume_name = part
+        elif re.fullmatch(r'P_\d+GPa', part):
+            pressure_name = part
+
+    return {
+        'structure_name': structure_name,
+        'volume_name': volume_name,
+        'pressure_name': pressure_name,
+    }
+
+
 def get_structure_name(task_path: str, config: dict) -> str:
     """从任务路径中提取结构名称"""
     structures_dir = Path(config['manager']['structures_dir']).resolve()

@@ -994,7 +994,7 @@ def cmd_sync(args):
         from .manager import Manager
 
         manager = Manager(config)
-        synced_counts = manager.sync_queue_from_filesystem()
+        synced_counts = manager.sync_plain_submit_tasks()
 
         # 显示同步结果
         print("\n同步完成！")

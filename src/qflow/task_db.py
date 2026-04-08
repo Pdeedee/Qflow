@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Optional, List, Dict
 from contextlib import contextmanager
 
-from .utils import load_config, get_task_type
+from .utils import load_config, get_task_type, parse_task_metadata
 
 
 class TaskDB:
@@ -21,7 +21,8 @@ class TaskDB:
         'phonon': 50,
         'bte_fc2': 45,   # BTE fc2 位移单点
         'bte_fc3': 40,   # BTE fc3 位移单点
-        'qha': 30
+        'qha': 30,
+        'plain': 20,
     }
 
     def __init__(self, config: dict = None):
@@ -42,6 +43,9 @@ class TaskDB:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     path TEXT UNIQUE NOT NULL,
                     task_type TEXT NOT NULL,
+                    structure_name TEXT,
+                    volume_name TEXT,
+                    pressure_name TEXT,
                     status TEXT NOT NULL DEFAULT 'pending',
                     priority INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
@@ -53,10 +57,53 @@ class TaskDB:
                     error_message TEXT
                 )
             ''')
+            self._ensure_column(conn, 'tasks', 'structure_name', 'TEXT')
+            self._ensure_column(conn, 'tasks', 'volume_name', 'TEXT')
+            self._ensure_column(conn, 'tasks', 'pressure_name', 'TEXT')
+
             # 创建索引加速查询
             conn.execute('CREATE INDEX IF NOT EXISTS idx_status ON tasks(status)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_priority ON tasks(priority DESC, created_at ASC)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_task_type ON tasks(task_type)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_structure_name ON tasks(structure_name)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_volume_name ON tasks(volume_name)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_pressure_name ON tasks(pressure_name)')
+            conn.commit()
+
+        self._backfill_task_metadata()
+
+    def _ensure_column(self, conn, table_name: str, column_name: str, column_def: str):
+        """确保表包含指定列。"""
+        cursor = conn.execute(f'PRAGMA table_info({table_name})')
+        columns = {row[1] for row in cursor.fetchall()}
+        if column_name not in columns:
+            conn.execute(f'ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}')
+
+    def _task_metadata(self, task_path: str) -> Dict[str, Optional[str]]:
+        """解析任务元数据。"""
+        return parse_task_metadata(task_path, self.config)
+
+    def _backfill_task_metadata(self):
+        """为已有任务回填结构/体积/压强元数据。"""
+        with self._get_conn() as conn:
+            cursor = conn.execute('''
+                SELECT path FROM tasks
+                WHERE structure_name IS NULL OR volume_name IS NULL OR pressure_name IS NULL
+            ''')
+            rows = cursor.fetchall()
+            for row in rows:
+                task_path = row['path']
+                metadata = self._task_metadata(task_path)
+                conn.execute('''
+                    UPDATE tasks
+                    SET structure_name = ?, volume_name = ?, pressure_name = ?
+                    WHERE path = ?
+                ''', (
+                    metadata['structure_name'],
+                    metadata['volume_name'],
+                    metadata['pressure_name'],
+                    task_path,
+                ))
             conn.commit()
 
     @contextmanager
@@ -97,17 +144,43 @@ class TaskDB:
 
         priority = self.PRIORITY.get(task_type, 0)
         now = datetime.now().isoformat()
+        metadata = self._task_metadata(task_path)
 
         with self._get_conn() as conn:
             try:
                 conn.execute('''
-                    INSERT INTO tasks (path, task_type, status, priority, created_at, updated_at)
-                    VALUES (?, ?, 'pending', ?, ?, ?)
-                ''', (task_path, task_type, priority, now, now))
+                    INSERT INTO tasks (
+                        path, task_type, structure_name, volume_name, pressure_name,
+                        status, priority, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                ''', (
+                    task_path,
+                    task_type,
+                    metadata['structure_name'],
+                    metadata['volume_name'],
+                    metadata['pressure_name'],
+                    priority,
+                    now,
+                    now,
+                ))
                 conn.commit()
                 return True
             except sqlite3.IntegrityError:
-                # 任务已存在
+                conn.execute('''
+                    UPDATE tasks
+                    SET task_type = ?, priority = ?, structure_name = ?,
+                        volume_name = ?, pressure_name = ?
+                    WHERE path = ?
+                ''', (
+                    task_type,
+                    priority,
+                    metadata['structure_name'],
+                    metadata['volume_name'],
+                    metadata['pressure_name'],
+                    task_path,
+                ))
+                conn.commit()
                 return False
 
     def get_pending_task(self) -> Optional[Dict]:
@@ -210,7 +283,8 @@ class TaskDB:
             return cursor.fetchone()[0]
 
     def get_tasks(self, status: str = None, task_type: str = None,
-                  limit: int = None) -> List[Dict]:
+                  structure_name: str = None, volume_name: str = None,
+                  pressure_name: str = None, limit: int = None) -> List[Dict]:
         """获取任务列表"""
         query = 'SELECT * FROM tasks WHERE 1=1'
         params = []
@@ -221,6 +295,15 @@ class TaskDB:
         if task_type:
             query += ' AND task_type = ?'
             params.append(task_type)
+        if structure_name:
+            query += ' AND structure_name = ?'
+            params.append(structure_name)
+        if volume_name:
+            query += ' AND volume_name = ?'
+            params.append(volume_name)
+        if pressure_name:
+            query += ' AND pressure_name = ?'
+            params.append(pressure_name)
 
         query += ' ORDER BY updated_at DESC'
 
@@ -254,6 +337,19 @@ class TaskDB:
         with self._get_conn() as conn:
             cursor = conn.execute(query, params)
             return [dict(row) for row in cursor]
+
+    def get_tasks_by_context(self, structure_name: str, volume_name: str = None,
+                             pressure_name: str = None, task_type: str = None,
+                             status: str = None, limit: int = None) -> List[Dict]:
+        """按结构/体积/压强上下文获取任务。"""
+        return self.get_tasks(
+            status=status,
+            task_type=task_type,
+            structure_name=structure_name,
+            volume_name=volume_name,
+            pressure_name=pressure_name,
+            limit=limit,
+        )
 
     def get_task(self, task_path: str) -> Optional[Dict]:
         """获取单个任务"""

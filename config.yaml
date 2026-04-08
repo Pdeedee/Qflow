@@ -10,6 +10,7 @@ manager:
   task_timeout: 7200           # 任务超时时间（秒）
   qha: true                    # 开启 QHA 工作流 (opt → phonon → qha)
   bte: false                   # 开启 BTE 工作流 (opt → fc2+fc3 → 热导率)
+  plain_submit: false          # 仅扫描所有 task.* 目录并直接提交，不做任务生成和后处理
 
 # Worker配置
 worker:
