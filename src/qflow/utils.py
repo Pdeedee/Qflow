@@ -8,6 +8,25 @@ from datetime import datetime
 from typing import Iterable, Union
 
 
+def get_status_files(config: dict) -> dict:
+    """获取状态文件配置，缺省时回退到默认值。"""
+    status_files = dict(config.get('status_files') or {})
+    return {
+        'running': status_files.get('running', '.running'),
+        'success': status_files.get('success', '.success'),
+        'failed': status_files.get('failed', '.failed'),
+    }
+
+
+def get_failure_config(config: dict) -> dict:
+    """获取失败处理配置，缺省时回退到默认值。"""
+    failure = dict(config.get('failure') or {})
+    return {
+        'task_error_file': failure.get('task_error_file', 'error.txt'),
+        'log_file': failure.get('log_file', './failed_tasks.txt'),
+    }
+
+
 def load_config(config_path: str = None) -> dict:
     """加载配置文件，优先级: 参数 > 环境变量 QFLOW_CONFIG > config.yaml"""
     if config_path is None:
@@ -21,7 +40,7 @@ def get_task_status(task_path: str, config: dict) -> str:
     获取任务状态
     返回: 'running', 'success', 'failed', 或 'pending'（无状态文件）
     """
-    status_files = config['status_files']
+    status_files = get_status_files(config)
     task_dir = Path(task_path)
 
     if (task_dir / status_files['success']).exists():
@@ -40,7 +59,8 @@ def clear_task_status(task_path: Union[str, Path], config: dict,
     Returns:
         实际删除的状态文件数量。
     """
-    status_files = config['status_files']
+    status_files = get_status_files(config)
+    failure_config = get_failure_config(config)
     task_dir = Path(task_path)
     statuses = tuple(statuses or ('running', 'success', 'failed'))
 
@@ -59,7 +79,7 @@ def clear_task_status(task_path: Union[str, Path], config: dict,
             print(f"Warning: Failed to remove status file {status_file}: {e}")
 
     if remove_error_log:
-        error_file = task_dir / config['failure']['task_error_file']
+        error_file = task_dir / failure_config['task_error_file']
         try:
             if error_file.exists():
                 error_file.unlink()
@@ -74,7 +94,8 @@ def set_task_status(task_path: str, status: str, config: dict, error_msg: str = 
     设置任务状态
     status: 'running', 'success', 'failed'
     """
-    status_files = config['status_files']
+    status_files = get_status_files(config)
+    failure_config = get_failure_config(config)
     task_dir = Path(task_path)
 
     # 删除旧的状态文件
@@ -86,14 +107,15 @@ def set_task_status(task_path: str, status: str, config: dict, error_msg: str = 
 
     # 如果是失败状态，记录错误信息
     if status == 'failed' and error_msg:
-        error_file = task_dir / config['failure']['task_error_file']
+        error_file = task_dir / failure_config['task_error_file']
         with open(error_file, 'w', encoding='utf-8') as f:
             f.write(f"{datetime.now().isoformat()}\n{error_msg}\n")
 
 
 def record_failed_task(task_path: str, config: dict):
     """记录失败任务路径到全局失败日志"""
-    log_file = Path(config['failure']['log_file'])
+    failure_config = get_failure_config(config)
+    log_file = Path(failure_config['log_file'])
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     with open(log_file, 'a', encoding='utf-8') as f:
         f.write(f"{timestamp} | {task_path}\n")

@@ -10,7 +10,7 @@ import signal
 import time
 from pathlib import Path
 
-from .utils import load_config, clear_task_status
+from .utils import load_config, clear_task_status, get_status_files
 from .template import generate_manager_script
 
 
@@ -233,7 +233,8 @@ def _sync_tracked_running_tasks(config, db, work_dir: Path):
         active_jobs = set(result.stdout.strip().split())
 
     stale_job_ids = []
-    failed_status_name = config['status_files']['failed']
+    status_files = get_status_files(config)
+    failed_status_name = status_files['failed']
 
     for task_data in running_tasks:
         task_path = task_data['path']
@@ -245,7 +246,7 @@ def _sync_tracked_running_tasks(config, db, work_dir: Path):
             stale_job_ids.append(slurm_job_id)
             continue
 
-        if (task_dir / config['status_files']['success']).exists():
+        if (task_dir / status_files['success']).exists():
             clear_task_status(task_dir, config, statuses=['running'])
             db.update_status(task_path, 'success')
             stale_job_ids.append(slurm_job_id)
@@ -253,7 +254,7 @@ def _sync_tracked_running_tasks(config, db, work_dir: Path):
             clear_task_status(task_dir, config, statuses=['running'])
             db.update_status(task_path, 'failed')
             stale_job_ids.append(slurm_job_id)
-        elif not (task_dir / config['status_files']['running']).exists():
+        elif not (task_dir / status_files['running']).exists():
             db.reset_task_to_pending(task_path)
             stale_job_ids.append(slurm_job_id)
         elif active_jobs and slurm_job_id and slurm_job_id not in active_jobs:
