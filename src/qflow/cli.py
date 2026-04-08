@@ -74,6 +74,11 @@ def _get_manager_mode():
     return config.get('manager', {}).get('mode', 'sbatch'), config
 
 
+def _manager_job_file(work_dir: Path) -> Path:
+    """当前工作目录的 manager job id 文件。"""
+    return work_dir / 'manager.jobid'
+
+
 def _is_manager_running(config=None):
     """检查 manager 是否在运行，返回 (running: bool, info: str)"""
     if config is None:
@@ -92,14 +97,21 @@ def _is_manager_running(config=None):
                 pid_file.unlink()
         return False, ""
     else:
+        job_file = _manager_job_file(work_dir)
+        if not job_file.exists():
+            return False, ""
+
+        job_id = job_file.read_text().strip()
         result = subprocess.run(
-            "squeue -u $USER -n qflow_manager -o '%.18i' -h",
-            shell=True, capture_output=True, text=True
+            ['squeue', '-j', job_id, '-h', '-o', '%i'],
+            capture_output=True,
+            text=True
         )
         if result.returncode == 0:
             ids = result.stdout.strip().split()
-            if ids:
-                return True, f"SLURM 作业: {', '.join(ids)}"
+            if job_id in ids:
+                return True, f"SLURM 作业: {job_id}"
+        job_file.unlink(missing_ok=True)
         return False, ""
 
 
@@ -129,22 +141,28 @@ def _cancel_manager(config=None):
             print("没有找到运行中的 Manager")
         return False
     else:
+        job_file = _manager_job_file(work_dir)
+        if not job_file.exists():
+            print("没有找到当前工作目录的 Manager 作业记录")
+            return False
+
+        job_id = job_file.read_text().strip()
         result = subprocess.run(
-            "squeue -u $USER -n qflow_manager -o '%.18i' -h",
-            shell=True, capture_output=True, text=True
+            ['squeue', '-j', job_id, '-h', '-o', '%i'],
+            capture_output=True,
+            text=True
         )
         if result.returncode == 0:
-            manager_ids = result.stdout.strip().split()
-            if manager_ids:
-                print(f"找到 {len(manager_ids)} 个 Manager 作业")
-                for job_id in manager_ids:
-                    subprocess.run(f"scancel {job_id}", shell=True)
-                    print(f"  已取消 Manager 作业 {job_id}")
+            active_ids = result.stdout.strip().split()
+            if job_id in active_ids:
+                subprocess.run(['scancel', job_id], capture_output=True, text=True)
+                print(f"已取消当前工作目录的 Manager 作业 {job_id}")
+                job_file.unlink(missing_ok=True)
                 return True
-            else:
-                print("没有找到运行中的 Manager")
-        else:
-            print("查询SLURM作业失败")
+            print("当前工作目录的 Manager 作业已不存在")
+            job_file.unlink(missing_ok=True)
+            return False
+        print("查询SLURM作业失败")
         return False
 
 
@@ -254,8 +272,10 @@ def cmd_manager(args):
         import os
         if 'SLURM_JOB_ID' in os.environ:
             # 在 SLURM 作业中，直接运行 manager
-            from .manager import Manager
             config = load_config()
+            work_dir = Path(config.get('work_dir', '.')).resolve()
+            _manager_job_file(work_dir).write_text(os.environ['SLURM_JOB_ID'])
+            from .manager import Manager
             manager = Manager(config)
             manager.run()
         else:
@@ -320,6 +340,7 @@ def cmd_manager(args):
 
                 if result.returncode == 0:
                     job_id = result.stdout.strip().split()[-1]
+                    _manager_job_file(work_dir).write_text(job_id)
                     print(f"✓ Manager 已提交到 SLURM")
                     print(f"  作业ID: {job_id}")
                     print(f"  日志: log/manager_{job_id}.log")
