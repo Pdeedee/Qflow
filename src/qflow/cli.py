@@ -544,10 +544,10 @@ def cmd_status(args):
     print("└──────────────┴─────────┴─────────┴─────────┴─────────┘")
 
     # 统计虚频结构数量
-    qha_dir = work_dir / 'qha_structures'
-    if qha_dir.exists():
-        imag_count = len(list(qha_dir.glob('*/.has_imag')))
-        total_structs = len([d for d in qha_dir.iterdir() if d.is_dir()])
+    structures_dir = (work_dir / config['manager']['structures_dir']).resolve()
+    if structures_dir.exists():
+        imag_count = len(list(structures_dir.glob('*/.has_imag')))
+        total_structs = len([d for d in structures_dir.iterdir() if d.is_dir()])
         if imag_count > 0:
             print(f"\n⚠ 存在虚频的结构: {imag_count}/{total_structs}")
 
@@ -972,6 +972,7 @@ def cmd_sync(args):
 
     config = load_config()
     running, info = _is_manager_running(config)
+    manager_mode = config.get('manager', {}).get('mode', 'sbatch')
     work_dir = Path(config.get('work_dir', '.')).resolve()
 
     from .task_db import TaskDB
@@ -985,8 +986,8 @@ def cmd_sync(args):
         synced_counts = db.add_tasks_ignore_existing(scanner.scan(plain_only=plain_submit))
         return db, synced_counts
 
-    if running:
-        # manager 在运行，先停掉再重启
+    if running and manager_mode != 'local':
+        # 远程 manager 在运行，先停掉再重启，避免远程 manager 和 sync 并发操作数据库
         print(f"检测到运行中的 Manager ({info})")
         print("停止 Manager...")
         _cancel_manager(config)
@@ -1002,6 +1003,10 @@ def cmd_sync(args):
             [sys.executable, '-m', 'qflow.cli', 'manager', 'run'],
             cwd=work_dir
         )
+    elif running:
+        print(f"检测到本地运行中的 Manager ({info})")
+        print("执行队列同步，不停止本地 Manager...\n")
+        db, synced_counts = run_sync_once()
     else:
         # manager 没有运行，直接同步
         print("Manager未运行，执行队列同步...\n")
