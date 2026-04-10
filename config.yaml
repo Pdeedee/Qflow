@@ -88,6 +88,15 @@ qha:
 
 # VASP INCAR设置（仅vasp模式使用）
 # 参考 /home/liuzifeng/data/80relax 的设置
+# 可选 vasp_sets:
+#   opt/qha_opt/bte_opt/plain/phonon: matpes | mpstatic | mprelax
+vasp_sets:
+  opt: mprelax
+  qha_opt: mprelax
+  bte_opt: mprelax
+  phonon: matpes
+  plain: matpes
+
 incar:
   # 结构优化设置
   opt:
@@ -131,6 +140,27 @@ incar:
     NSW: 0                  # 不进行离子步
     PREC: Accurate          # 高精度
     SIGMA: 0.01             # 展宽参数
+
+  # plain_submit 任务默认复用单点设置；可按需单独覆盖
+  plain:
+    ALGO: Normal
+    EDIFF: 1.0e-08
+    ENAUG: 1360
+    ENCUT: 680
+    GGA: Pe
+    IBRION: -1
+    ISMEAR: 0
+    LAECHG: True
+    LASPH: True
+    LCHARG: False
+    LMAXMIX: 6
+    LMIXTAU: True
+    LREAL: False
+    NELM: 200
+    NELMIN: 6
+    NSW: 0
+    PREC: Accurate
+    SIGMA: 0.01
 
 # BTE (phono3py) 热导率计算配置
 bte:

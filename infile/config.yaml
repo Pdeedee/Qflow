@@ -1,0 +1,169 @@
+# QFlow template config
+# 复制到你的工作目录后重命名为 config.yaml 使用。
+# 这个模板偏向 VASP 工作流，同时保留 plain_submit / QHA / BTE 的常用入口。
+
+# 工作目录。绝大多数相对路径都以这里为基准。
+work_dir: .
+
+manager:
+  structures_dir: ./qha_structures   # 结构根目录；普通模式下通常里面放 mp-xxx 之类结构目录
+  scan_interval: 10                  # manager 轮询间隔（秒）
+  task_timeout: 7200                 # 预留字段；当前主要靠状态标记和数据库管理
+  qha: true                          # 是否启用 QHA 工作流
+  bte: false                         # 是否启用 BTE 工作流
+  plain_submit: false                # true 时只递归扫描并提交已有 task.*，不生成 opt/phonon/qha/bte 任务，也不做后处理
+
+worker:
+  mode: vasp                         # mattersim 或 vasp；只有 vasp 模式才会生成 INCAR/KPOINTS/POTCAR
+  vasp_cmd: "/home/share/apps/openmpi-5.0.7/bin/mpirun /home/share/apps/vasp.6.3.2/bin/vasp_std"  # 你的 VASP 启动命令
+  job_name: "qflow_worker"           # sbatch 中的任务名前缀
+
+slurm:
+  nodes: 1                           # manager 和子任务默认都复用这套 sbatch 资源配置
+  ntasks_per_node: 36
+  partition: cpu
+  time: "150:00:00"                  # 作业最长运行时间
+  python_path: null                  # null 表示使用当前环境的 python；也可以填绝对路径
+  module_init_script: null           # 如集群需要 module 命令，填初始化脚本
+  modules: []                        # 需要预加载的 module 列表
+  extra_commands:
+    # 提交脚本里会原样执行，可用于补环境变量、source 某些软件环境等
+    - export LD_LIBRARY_PATH=/home/share/apps/openmpi-5.0.7/lib:/home/share/apps/scalapack-2.2.2/lib:/home/share/apps/fftw-3.3.10/lib:/home/share/apps/openblas/lib:$LD_LIBRARY_PATH
+
+opt:
+  fmax: 0.01                         # 几何优化收敛阈值（当前更多是语义配置）
+  refine_structure: true             # 是否先用 pymatgen 标准化 primitive 结构
+
+status_files:
+  running: ".running"                # 任务已提交/运行中的标记
+  success: ".success"                # 任务成功完成标记
+  failed: ".failed"                  # 任务失败标记；失败后默认不会自动重投，要 reset
+
+failure:
+  log_file: ./failed_tasks.txt       # 全局失败任务路径记录
+  task_error_file: error.log         # 单个 task.* 目录下的错误信息文件名
+
+task_types:
+  opt: "opt"                         # 历史兼容字段，通常不用改
+  phonon: "phonon"
+  qha: "qha"
+  bte_fc2: "bte_fc2"
+  bte_fc3: "bte_fc3"
+
+phonon:
+  supercell: null                    # 手动指定超胞矩阵；null 表示自动生成
+  max_atoms: 100                     # 自动超胞时的最大原子数
+  displacement_distance: 0.01        # phonopy 位移量（Å）
+  t_min: 0                           # 后处理热力学最低温度（K）
+  t_max: 1000                        # 后处理热力学最高温度（K）
+  t_step: 10                         # 温度步长（K）
+
+qha:
+  volumes: [0.98, 0.99, 1.0, 1.01, 1.02]  # 体积缩放点；1.0 是平衡体积
+  pressure: 0                        # QHA 后处理压力（GPa）
+  t_min: 0
+  t_max: 800
+  t_step: 10
+
+# 各类任务默认使用哪个 pymatgen VASP 输入集。
+# 可选值：
+#   - matpes   -> MatPESStaticSet
+#   - mpstatic -> MPStaticSet
+#   - mprelax  -> MPRelaxSet
+# 常见建议：
+#   - opt/qha_opt/bte_opt 用 mprelax
+#   - phonon/plain 用 matpes 或 mpstatic
+# plain_submit 模式下，task.* 会读取 vasp_sets.plain。
+
+vasp_sets:
+  opt: mprelax                       # 结构优化目录，如 mp-xxx/opt
+  qha_opt: mprelax                   # QHA 各体积点的 opt
+  bte_opt: mprelax                   # BTE 各压力点的 opt
+  phonon: matpes                     # phonon/qha/bte_fc2/bte_fc3 默认单点任务
+  plain: matpes                      # plain_submit 模式下 task.* 用这一项
+
+# INCAR 会覆盖所选 VASP set 的默认参数。
+# 如果 plain_submit: true 且 worker.mode: vasp：
+#   - task.* 优先读取 incar.plain
+#   - 若未配置 incar.plain，会回退到 incar.phonon，再回退到 incar.opt
+# 下面这套只是模板，实际请按你的体系/泛函/精度要求改。
+incar:
+  opt:
+    ADDGRID: true                    # 更稳定的积分网格
+    ALGO: Normal
+    EDIFF: 1.0e-08
+    EDIFFG: -1.0e-03                 # 力收敛阈值
+    ENCUT: 520
+    IBRION: 1
+    ISIF: 3                          # 优化晶格和原子
+    ISMEAR: 0
+    KSPACING: 0.2
+    LASPH: true
+    LCHARG: false
+    LMAXMIX: 6
+    LREAL: false
+    NELM: 100
+    NELMIN: 6
+    NSW: 99                          # 最大离子步数
+    PREC: Accurate
+    SIGMA: 0.01
+    SYMPREC: 1.0e-08                 # 对称性精度；对结构标准化和一致性有帮助
+
+  phonon:
+    ALGO: Normal
+    EDIFF: 1.0e-08
+    ENAUG: 1360                      # 力常数单点一般会设得更严格
+    ENCUT: 680
+    GGA: Pe
+    IBRION: -1                       # 单点
+    ISMEAR: 0
+    LAECHG: true
+    LASPH: true
+    LCHARG: false
+    LMAXMIX: 6
+    LMIXTAU: true
+    LREAL: false
+    NELM: 200
+    NELMIN: 6
+    NSW: 0                           # 不做离子步
+    PREC: Accurate
+    SIGMA: 0.01
+
+  plain:
+    # plain_submit 默认就是“已有 task.* 直接提交”。
+    # 如果你想让 plain 任务表现得像静态计算，这里通常设 IBRION=-1, NSW=0。
+    # 如果你想让 plain 任务做 relax，也可以把 vasp_sets.plain 改成 mprelax，
+    # 同时在这里把 IBRION/ISIF/NSW 等参数改成优化语义。
+    ALGO: Normal
+    EDIFF: 1.0e-08
+    ENAUG: 1360
+    ENCUT: 680
+    GGA: Pe
+    IBRION: -1
+    ISMEAR: 0
+    LAECHG: true
+    LASPH: true
+    LCHARG: false
+    LMAXMIX: 6
+    LMIXTAU: true
+    LREAL: false
+    NELM: 200
+    NELMIN: 6
+    NSW: 0
+    PREC: Accurate
+    SIGMA: 0.01
+
+bte:
+  supercell: null                    # phono3py 超胞矩阵；null 表示自动
+  max_atoms: null                    # 自动超胞原子数上限；null 表示按程序默认
+  min_atoms: 100                     # 自动超胞原子数下限
+  min_length: 10.0                   # 自动超胞最小边长
+  displacement_distance: 0.03        # BTE 位移一般比 harmonic 略大
+  symprec: 1.0e-03
+  method: RTA                        # RTA 或 LBTE
+  is_isotope: true                   # 是否考虑同位素散射
+  tmin: 50
+  tmax: 500
+  tstep: 50
+  target_length: 60.0                # q-mesh 目标实空间长度
+  max_mesh: 24                       # 单方向 q-mesh 最大值

@@ -78,6 +78,13 @@ bte:
   max_mesh: 24
 
 # VASP INCAR 设置
+vasp_sets:
+  opt: mprelax
+  qha_opt: mprelax
+  bte_opt: mprelax
+  phonon: matpes
+  plain: matpes
+
 incar:
   # r2SCAN 结构优化
   opt:
@@ -106,6 +113,29 @@ incar:
 
   # r2SCAN 单点（fc2/fc3 位移力计算）
   phonon:
+    ALGO: Normal
+    EDIFF: 1.0e-08
+    ENCUT: 680
+    ENAUG: 1360
+    IBRION: -1
+    ISMEAR: 0
+    ISPIN: 1
+    ISTART: 0
+    KSPACING: 0.22
+    LASPH: True
+    LCHARG: False
+    LMAXMIX: 6
+    LMIXTAU: True
+    LREAL: False
+    LWAVE: False
+    METAGGA: R2scan
+    NELM: 200
+    NELMIN: 6
+    NSW: 0
+    PREC: Accurate
+    SIGMA: 0.05
+
+  plain:
     ALGO: Normal
     EDIFF: 1.0e-08
     ENCUT: 680

@@ -748,7 +748,7 @@ class Manager:
             vasp_type_map = {
                 'opt': 'opt', 'qha_opt': 'qha_opt', 'phonon': 'phonon',
                 'bte_opt': 'bte_opt', 'bte_fc2': 'phonon', 'bte_fc3': 'phonon',
-                'qha': 'phonon', 'plain': 'phonon',
+                'qha': 'phonon', 'plain': 'plain',
             }
             vasp_type = vasp_type_map.get(task_type, 'phonon')
             if self.worker_mode == 'vasp':
@@ -914,7 +914,8 @@ class Manager:
                 - 'opt': 结构优化，使用 MPRelaxSet + ISIF=3
                 - 'qha_opt': QHA体积点优化，使用 MPRelaxSet + ISIF=2
                 - 'bte_opt': BTE压强点优化，使用 MPRelaxSet + ISIF=3 + PSTRESS
-                - 'phonon': 声子/BTE单点计算，使用 MPStaticSet
+                - 'phonon': 声子/BTE单点计算，默认使用 MatPESStaticSet
+                - 'plain': plain_submit 任务，默认使用 MatPESStaticSet
         """
         import warnings
         import re
@@ -928,14 +929,19 @@ class Manager:
         # 实时读取最新的 config.yaml incar 设置
         fresh_config = load_config()
         incar_config = fresh_config.get('incar', {})
+        vasp_set_config = fresh_config.get('vasp_sets', {})
         incar_opt = incar_config.get('opt', {})
         incar_phonon = incar_config.get('phonon', {})
+        incar_plain = incar_config.get('plain', {})
         incar_qha_opt = incar_config.get('qha_opt', {})
 
         # 兼容旧配置格式
         if not incar_opt and not incar_phonon:
             incar_opt = incar_config
             incar_phonon = incar_config
+
+        if not incar_plain:
+            incar_plain = incar_phonon or incar_opt
 
         # 如果没有配置qha_opt，使用opt的配置但修改ISIF=2
         if not incar_qha_opt and incar_opt:
@@ -944,14 +950,59 @@ class Manager:
 
         structure = PMGStructure.from_file(str(poscar))
 
+        def resolve_vasp_set_name(current_task_type: str) -> str:
+            configured = vasp_set_config.get(current_task_type)
+            if configured:
+                return str(configured).strip().lower()
+
+            default_map = {
+                'opt': 'mprelax',
+                'qha_opt': 'mprelax',
+                'bte_opt': 'mprelax',
+                'phonon': 'matpes',
+                'plain': 'matpes',
+            }
+            return default_map.get(current_task_type, 'mprelax')
+
+        def build_vasp_set(set_name: str, incar_settings: dict):
+            alias_map = {
+                'matpes': 'matpes',
+                'matpesstatic': 'matpes',
+                'matpesstaticset': 'matpes',
+                'mpstatic': 'mpstatic',
+                'mpstaticset': 'mpstatic',
+                'mprelax': 'mprelax',
+                'mprelaxed': 'mprelax',
+                'mprelaxset': 'mprelax',
+            }
+            normalized = alias_map.get(set_name)
+            if normalized is None:
+                raise ValueError(f"Unsupported vasp set '{set_name}' for task {task_type}")
+
+            if normalized == 'matpes':
+                return MatPESStaticSet(
+                    structure,
+                    user_incar_settings=incar_settings,
+                    user_potcar_functional=self.potcar_functional,
+                )
+            if normalized == 'mpstatic':
+                return MPStaticSet(
+                    structure,
+                    user_incar_settings=incar_settings,
+                    user_potcar_functional=self.potcar_functional,
+                )
+            return MPRelaxSet(
+                structure,
+                user_incar_settings=incar_settings,
+                user_potcar_functional=self.potcar_functional,
+            )
+
         if task_type == 'phonon':
             incar_settings = incar_phonon
-            mp_set = MatPESStaticSet(structure, user_incar_settings=incar_settings,
-                                    user_potcar_functional=self.potcar_functional)
+        elif task_type == 'plain':
+            incar_settings = incar_plain
         elif task_type == 'qha_opt':
             incar_settings = incar_qha_opt
-            mp_set = MPRelaxSet(structure, user_incar_settings=incar_settings,
-                               user_potcar_functional=self.potcar_functional)
         elif task_type == 'bte_opt':
             # BTE 压强优化: ISIF=3 + PSTRESS
             incar_settings = incar_opt.copy()
@@ -963,12 +1014,11 @@ class Manager:
                     pressure_gpa = int(m.group(1))
                     break
             incar_settings['PSTRESS'] = pressure_gpa * 10  # GPa -> kBar
-            mp_set = MPRelaxSet(structure, user_incar_settings=incar_settings,
-                               user_potcar_functional=self.potcar_functional)
         else:
             incar_settings = incar_opt
-            mp_set = MPRelaxSet(structure, user_incar_settings=incar_settings,
-                               user_potcar_functional=self.potcar_functional)
+
+        set_name = resolve_vasp_set_name(task_type)
+        mp_set = build_vasp_set(set_name, incar_settings)
 
         mp_set.write_input(str(task_dir))
 
