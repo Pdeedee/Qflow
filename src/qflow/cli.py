@@ -235,6 +235,8 @@ def _sync_tracked_running_tasks(config, db, work_dir: Path):
     stale_job_ids = []
     status_files = get_status_files(config)
     failed_status_name = status_files['failed']
+    status_updates = []
+    pending_paths = []
 
     for task_data in running_tasks:
         task_path = task_data['path']
@@ -242,27 +244,29 @@ def _sync_tracked_running_tasks(config, db, work_dir: Path):
         slurm_job_id = task_data.get('slurm_job_id')
 
         if not task_dir.exists():
-            db.reset_task_to_pending(task_path)
+            pending_paths.append(task_path)
             stale_job_ids.append(slurm_job_id)
             continue
 
         if (task_dir / status_files['success']).exists():
             clear_task_status(task_dir, config, statuses=['running'])
-            db.update_status(task_path, 'success')
+            status_updates.append((task_path, 'success'))
             stale_job_ids.append(slurm_job_id)
         elif (task_dir / failed_status_name).exists():
             clear_task_status(task_dir, config, statuses=['running'])
-            db.update_status(task_path, 'failed')
+            status_updates.append((task_path, 'failed'))
             stale_job_ids.append(slurm_job_id)
         elif not (task_dir / status_files['running']).exists():
-            db.reset_task_to_pending(task_path)
+            pending_paths.append(task_path)
             stale_job_ids.append(slurm_job_id)
         elif active_jobs and slurm_job_id and slurm_job_id not in active_jobs:
             clear_task_status(task_dir, config, statuses=['running'])
             (task_dir / failed_status_name).touch()
-            db.update_status(task_path, 'failed')
+            status_updates.append((task_path, 'failed'))
             stale_job_ids.append(slurm_job_id)
 
+    db.reset_tasks_to_pending_bulk(pending_paths)
+    db.update_status_bulk(status_updates)
     _remove_job_mappings(work_dir, stale_job_ids)
 
 

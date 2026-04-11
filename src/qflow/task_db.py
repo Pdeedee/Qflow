@@ -301,6 +301,24 @@ class TaskDB:
                 ''', (status, now, task_path))
             conn.commit()
 
+    def update_status_bulk(self, task_updates: List[tuple]):
+        """批量更新任务状态。
+
+        task_updates: [(task_path, status), ...]
+        """
+        if not task_updates:
+            return 0
+
+        now = datetime.now().isoformat()
+        with self._get_conn() as conn:
+            conn.executemany('''
+                UPDATE tasks
+                SET status = ?, updated_at = ?
+                WHERE path = ?
+            ''', [(status, now, task_path) for task_path, status in task_updates])
+            conn.commit()
+            return len(task_updates)
+
     def update_task_time(self, task_path: str, start_time: str, end_time: str,
                          duration_seconds: float, status: str):
         """更新任务执行时间"""
@@ -496,6 +514,27 @@ class TaskDB:
             ''', (now, task_path))
             conn.commit()
             return cursor.rowcount > 0
+
+    def reset_tasks_to_pending_bulk(self, task_paths: List[str]) -> int:
+        """批量将指定任务重置为pending状态。"""
+        if not task_paths:
+            return 0
+
+        now = datetime.now().isoformat()
+        with self._get_conn() as conn:
+            conn.executemany('''
+                UPDATE tasks
+                SET status = 'pending',
+                    updated_at = ?,
+                    start_time = NULL,
+                    end_time = NULL,
+                    duration_seconds = NULL,
+                    slurm_job_id = NULL,
+                    error_message = NULL
+                WHERE path = ?
+            ''', [(now, task_path) for task_path in task_paths])
+            conn.commit()
+            return len(task_paths)
 
     def remove_task(self, task_path: str) -> bool:
         """从数据库中删除指定任务"""
