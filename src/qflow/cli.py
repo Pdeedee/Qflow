@@ -984,11 +984,18 @@ def cmd_sync(args):
         plain_submit = config.get('manager', {}).get('plain_submit', False)
         scanner = SubmitTaskScanner(work_dir, structures_dir)
 
+        def report_scan_progress(scanned: int, matched: int):
+            print(f"  扫描中: 已看 {scanned} 项，命中 {matched} 条")
+
         def report_progress(processed: int, added: int, existing: int):
             print(f"  已处理 {processed} 条，新增 {added}，已存在 {existing}")
 
         synced_counts = db.add_tasks_ignore_existing(
-            scanner.iter_scan(plain_only=plain_submit),
+            scanner.iter_scan(
+                plain_only=plain_submit,
+                progress_callback=report_scan_progress,
+                progress_every=5000,
+            ),
             batch_size=5000,
             progress_callback=report_progress,
         )
