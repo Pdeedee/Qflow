@@ -38,17 +38,13 @@ def load_config(config_path: str = None) -> dict:
 def get_task_status(task_path: str, config: dict) -> str:
     """
     获取任务状态
-    返回: 'running', 'success', 'failed', 或 'pending'（无状态文件）
+    返回: 'success' 或 'pending'（无 success 标记）
     """
     status_files = get_status_files(config)
     task_dir = Path(task_path)
 
     if (task_dir / status_files['success']).exists():
         return 'success'
-    if (task_dir / status_files['failed']).exists():
-        return 'failed'
-    if (task_dir / status_files['running']).exists():
-        return 'running'
     return 'pending'
 
 
@@ -71,20 +67,14 @@ def clear_task_status(task_path: Union[str, Path], config: dict,
             continue
 
         status_file = task_dir / status_name
-        try:
-            if status_file.exists():
-                status_file.unlink()
-                removed += 1
-        except (FileNotFoundError, PermissionError) as e:
-            print(f"Warning: Failed to remove status file {status_file}: {e}")
+        if status_file.exists():
+            status_file.unlink()
+            removed += 1
 
     if remove_error_log:
         error_file = task_dir / failure_config['task_error_file']
-        try:
-            if error_file.exists():
-                error_file.unlink()
-        except (FileNotFoundError, PermissionError) as e:
-            print(f"Warning: Failed to remove error file {error_file}: {e}")
+        if error_file.exists():
+            error_file.unlink()
 
     return removed
 
@@ -101,9 +91,9 @@ def set_task_status(task_path: str, status: str, config: dict, error_msg: str = 
     # 删除旧的状态文件
     clear_task_status(task_dir, config, statuses=['running', 'success', 'failed'])
 
-    # 创建新的状态文件
-    if status in status_files:
-        (task_dir / status_files[status]).touch()
+    # 只有 success 会落文件标记；running/failed 由数据库追踪
+    if status == 'success':
+        (task_dir / status_files['success']).touch()
 
     # 如果是失败状态，记录错误信息
     if status == 'failed' and error_msg:

@@ -116,20 +116,25 @@ class Manager:
     # ========== 任务状态管理 ==========
 
     def get_task_status(self, task_path: Path) -> str:
-        """检查任务状态（基于文件系统标记）
-
-        Returns: 'success', 'failed', 'running', 'pending', 'not_ready'
-        """
+        """检查任务状态（仅识别 .success，其他状态由数据库维护）"""
         if (task_path / '.success').exists():
             return 'success'
-        if (task_path / '.failed').exists():
-            return 'failed'
-        if (task_path / '.running').exists():
-            return 'running'
-        # 检查是否有POSCAR（表示任务已准备好）
         if (task_path / 'POSCAR').exists():
             return 'pending'
         return 'not_ready'
+
+    def _get_active_slurm_jobs(self) -> Optional[Set[str]]:
+        """获取当前活跃的 SLURM job id；查询失败时返回 None。"""
+        result = subprocess.run(
+            ['squeue', '-u', os.environ.get('USER', 'root'), '-h', '-o', '%i'],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            logger.warning("查询 squeue 失败，跳过 running 状态校正")
+            return None
+        return {job_id for job_id in result.stdout.strip().split() if job_id}
 
     def _task_relpath(self, task_path: Path) -> str:
         """获取相对 work_dir 的任务路径。"""
@@ -186,12 +191,11 @@ class Manager:
             for task_data in self.db.get_tasks(status=status):
                 task_dir = self.work_dir / task_data['path']
                 if task_dir.exists():
-                    self._extract_task_time(task_dir)
+                    self._extract_task_time(task_dir, status)
 
-    def _extract_task_time(self, task_dir: Path):
+    def _extract_task_time(self, task_dir: Path, task_status: str):
         """从任务目录的.task_time文件提取执行时间并更新到队列"""
-        status = self.get_task_status(task_dir)
-        if status not in ['success', 'failed']:
+        if task_status not in ['success', 'failed']:
             return
 
         # 获取任务相对路径
@@ -216,7 +220,7 @@ class Manager:
             start_time = time_data.get('start_time', '')
             end_time = time_data.get('end_time', '')
             duration = float(time_data.get('duration_seconds', 0))
-            task_status = time_data.get('status', status)
+            task_status = time_data.get('status', task_status)
 
             if start_time and end_time:
                 self.record_task_time(task_dir, start_time, end_time, duration, task_status)
@@ -245,8 +249,8 @@ class Manager:
             start_dt = datetime.fromisoformat(start_time)
             end_dt = datetime.fromisoformat(end_time)
             duration = (end_dt - start_dt).total_seconds()
-            self.record_task_time(task_dir, start_time, end_time, duration, status)
-            self.db.update_task_time(task_rel, start_time, end_time, duration, status)
+            self.record_task_time(task_dir, start_time, end_time, duration, task_status)
+            self.db.update_task_time(task_rel, start_time, end_time, duration, task_status)
 
     # ========== 队列同步 ==========
 
@@ -286,13 +290,9 @@ class Manager:
                         synced_counts['added'] += 1
 
                     status = self.get_task_status(opt_dir)
-                    self.db.update_status(task_path, status)
                     if status == 'success':
+                        self.db.update_status(task_path, status)
                         synced_counts['updated_success'] += 1
-                    elif status == 'failed':
-                        synced_counts['updated_failed'] += 1
-                    elif status == 'running':
-                        synced_counts['updated_running'] += 1
 
                 # 扫描phonon/qha任务
                 for volume_dir in struct_dir.glob('volume_*'):
@@ -312,13 +312,9 @@ class Manager:
                             synced_counts['added'] += 1
 
                         status = self.get_task_status(task_dir)
-                        self.db.update_status(task_path, status)
                         if status == 'success':
+                            self.db.update_status(task_path, status)
                             synced_counts['updated_success'] += 1
-                        elif status == 'failed':
-                            synced_counts['updated_failed'] += 1
-                        elif status == 'running':
-                            synced_counts['updated_running'] += 1
 
                 # 扫描BTE任务 (P_XXGPa/opt, P_XXGPa/bte/fc2/task.*, P_XXGPa/bte/fc3/task.*)
                 for p_dir in struct_dir.glob('P_*GPa'):
@@ -335,13 +331,9 @@ class Manager:
                             synced_counts['added'] += 1
 
                         status = self.get_task_status(p_opt_dir)
-                        self.db.update_status(task_path, status)
                         if status == 'success':
+                            self.db.update_status(task_path, status)
                             synced_counts['updated_success'] += 1
-                        elif status == 'failed':
-                            synced_counts['updated_failed'] += 1
-                        elif status == 'running':
-                            synced_counts['updated_running'] += 1
 
                     # BTE fc2/fc3 任务
                     bte_dir = p_dir / 'bte'
@@ -364,13 +356,9 @@ class Manager:
                                     synced_counts['added'] += 1
 
                                 status = self.get_task_status(task_dir)
-                                self.db.update_status(task_path, status)
                                 if status == 'success':
+                                    self.db.update_status(task_path, status)
                                     synced_counts['updated_success'] += 1
-                                elif status == 'failed':
-                                    synced_counts['updated_failed'] += 1
-                                elif status == 'running':
-                                    synced_counts['updated_running'] += 1
 
         # 2. 删除队列中不存在的任务
         removed = self.db.remove_nonexistent_tasks(all_task_paths)
@@ -408,13 +396,9 @@ class Manager:
             task_path = record['path']
             task_dir = self.work_dir / task_path
             status = self.get_task_status(task_dir)
-            self.db.update_status(task_path, status)
             if status == 'success':
+                self.db.update_status(task_path, status)
                 synced_counts['updated_success'] += 1
-            elif status == 'failed':
-                synced_counts['updated_failed'] += 1
-            elif status == 'running':
-                synced_counts['updated_running'] += 1
 
         removed = 0
         for task_data in self.db.get_tasks():
@@ -477,48 +461,39 @@ class Manager:
         )
 
     def reconcile_tracked_tasks(self):
-        """启动恢复：仅回写数据库中已跟踪任务的文件系统状态。"""
+        """启动恢复：仅修正已跟踪任务中的缺失目录和 success 标记。"""
         logger.info("=== 恢复已跟踪任务状态 ===")
+
+        running_recovered = self.reconcile_tracked_running_tasks()
 
         recovered = {
             'success': 0,
-            'failed': 0,
-            'pending': 0,
-            'running': 0,
             'removed': 0,
         }
 
         for task_data in self.db.get_tasks():
             task_path_str = task_data['path']
             task_dir = self.work_dir / task_path_str
-            slurm_job_id = task_data.get('slurm_job_id')
+
+            if task_data['status'] == 'running':
+                continue
 
             if not task_dir.exists() or not (task_dir / 'POSCAR').exists():
                 if self.db.remove_task(task_path_str):
                     recovered['removed'] += 1
-                self._remove_job_mapping(slurm_job_id)
                 continue
 
-            fs_status = self.get_task_status(task_dir)
-            if fs_status == 'not_ready':
-                continue
-
-            if fs_status in ('success', 'failed'):
-                clear_task_status(task_dir, self.config, statuses=['running'])
-                self._remove_job_mapping(slurm_job_id)
-            elif fs_status == 'pending':
-                self._remove_job_mapping(slurm_job_id)
-
-            if fs_status != task_data['status']:
-                self.db.update_status(task_path_str, fs_status)
-                recovered[fs_status] += 1
+            if task_data['status'] != 'success' and (task_dir / '.success').exists():
+                self.db.update_status(task_path_str, 'success')
+                recovered['success'] += 1
 
         logger.info(
             "已恢复跟踪任务状态: "
+            f"running_success={running_recovered['success']}, "
+            f"running_failed={running_recovered['failed']}, "
+            f"running_pending={running_recovered['pending']}, "
+            f"running_removed={running_recovered['removed']}, "
             f"success={recovered['success']}, "
-            f"failed={recovered['failed']}, "
-            f"pending={recovered['pending']}, "
-            f"running={recovered['running']}, "
             f"removed={recovered['removed']}"
         )
         return recovered
@@ -533,34 +508,42 @@ class Manager:
             'pending': 0,
             'removed': 0,
         }
+        active_jobs = self._get_active_slurm_jobs()
+        status_updates = []
+        pending_paths = []
+        stale_job_ids = []
 
         for task_data in self.db.get_running_tasks():
             task_path_str = task_data['path']
             task_dir = self.work_dir / task_path_str
             slurm_job_id = task_data.get('slurm_job_id')
 
-            if not task_dir.exists():
-                self.db.reset_task_to_pending(task_path_str)
-                self._remove_job_mapping(slurm_job_id)
+            if not task_dir.exists() or not (task_dir / 'POSCAR').exists():
+                status_updates.append((task_path_str, 'failed'))
+                stale_job_ids.append(slurm_job_id)
+                recovered['failed'] += 1
                 recovered['removed'] += 1
                 continue
 
-            fs_status = self.get_task_status(task_dir)
-
-            if fs_status == 'success':
-                clear_task_status(task_dir, self.config, statuses=['running'])
-                self.db.update_status(task_path_str, 'success')
-                self._remove_job_mapping(slurm_job_id)
+            if (task_dir / '.success').exists():
+                clear_task_status(task_dir, self.config, statuses=['running', 'failed'])
+                status_updates.append((task_path_str, 'success'))
+                stale_job_ids.append(slurm_job_id)
                 recovered['success'] += 1
-            elif fs_status == 'failed':
-                clear_task_status(task_dir, self.config, statuses=['running'])
-                self.db.update_status(task_path_str, 'failed')
-                self._remove_job_mapping(slurm_job_id)
-                recovered['failed'] += 1
-            elif fs_status in ('pending', 'not_ready'):
-                self.db.reset_task_to_pending(task_path_str)
-                self._remove_job_mapping(slurm_job_id)
+            elif not slurm_job_id:
+                pending_paths.append(task_path_str)
+                stale_job_ids.append(slurm_job_id)
                 recovered['pending'] += 1
+            elif active_jobs is not None and slurm_job_id not in active_jobs:
+                clear_task_status(task_dir, self.config, statuses=['running', 'failed'])
+                status_updates.append((task_path_str, 'failed'))
+                stale_job_ids.append(slurm_job_id)
+                recovered['failed'] += 1
+
+        self.db.reset_tasks_to_pending_bulk(pending_paths)
+        self.db.update_status_bulk(status_updates)
+        for job_id in stale_job_ids:
+            self._remove_job_mapping(job_id)
 
         logger.info(
             "已恢复运行中任务状态: "
@@ -573,55 +556,50 @@ class Manager:
 
     def sync_running_tasks_status(self):
         """快速同步：只检查running任务的文件系统状态"""
+        running_tasks = self.db.get_running_tasks()
+        if not running_tasks:
+            return
+
         synced = 0
         reset_to_failed = 0
         reset_to_pending = 0
-        running_tasks = self.db.get_running_tasks()
-
-        # 获取当前所有活跃的SLURM job ID
-        active_jobs = set()
-        result = subprocess.run(
-            ['squeue', '-u', os.environ.get('USER', 'root'), '-h', '-o', '%i'],
-            capture_output=True, text=True, timeout=10
-        )
-        if result.returncode == 0:
-            active_jobs = set(result.stdout.strip().split())
+        active_jobs = self._get_active_slurm_jobs()
+        status_updates = []
+        pending_paths = []
+        stale_job_ids = []
 
         for task_data in running_tasks:
             task_path_str = task_data['path']
             task_path = self.work_dir / task_path_str
             slurm_job_id = task_data.get('slurm_job_id', '')
 
-            if not task_path.exists():
-                self.db.update_status(task_path_str, 'pending')
-                self._remove_job_mapping(slurm_job_id)
-                reset_to_pending += 1
+            if not task_path.exists() or not (task_path / 'POSCAR').exists():
+                status_updates.append((task_path_str, 'failed'))
+                stale_job_ids.append(slurm_job_id)
+                reset_to_failed += 1
                 continue
 
-            # 检查文件系统状态
             if (task_path / '.success').exists():
-                self.db.update_status(task_path_str, 'success')
-                self._remove_job_mapping(slurm_job_id)
+                clear_task_status(task_path, self.config, statuses=['running', 'failed'])
+                status_updates.append((task_path_str, 'success'))
+                stale_job_ids.append(slurm_job_id)
                 synced += 1
-            elif (task_path / '.failed').exists():
-                self.db.update_status(task_path_str, 'failed')
-                self._remove_job_mapping(slurm_job_id)
-                synced += 1
-            elif not (task_path / '.running').exists():
-                self.db.update_status(task_path_str, 'pending')
-                self._remove_job_mapping(slurm_job_id)
+            elif not slurm_job_id:
+                pending_paths.append(task_path_str)
+                stale_job_ids.append(slurm_job_id)
                 reset_to_pending += 1
-                logger.warning(f"任务 {task_path_str} 无运行标记，重置为pending")
-            elif active_jobs:
-                # .running存在，检查SLURM job是否还活着
-                if slurm_job_id and slurm_job_id not in active_jobs:
-                    # SLURM job已消失但没有.success/.failed，任务异常终止
-                    (task_path / '.running').unlink(missing_ok=True)
-                    (task_path / '.failed').touch()
-                    self.db.update_status(task_path_str, 'failed')
-                    self._remove_job_mapping(slurm_job_id)
-                    reset_to_failed += 1
-                    logger.warning(f"任务 {task_path_str} SLURM job {slurm_job_id} 已消失，标记为failed")
+                logger.warning(f"任务 {task_path_str} 缺少 slurm_job_id，重置为pending")
+            elif active_jobs is not None and slurm_job_id not in active_jobs:
+                clear_task_status(task_path, self.config, statuses=['running', 'failed'])
+                status_updates.append((task_path_str, 'failed'))
+                stale_job_ids.append(slurm_job_id)
+                reset_to_failed += 1
+                logger.warning(f"任务 {task_path_str} SLURM job {slurm_job_id} 已消失，标记为failed")
+
+        self.db.reset_tasks_to_pending_bulk(pending_paths)
+        self.db.update_status_bulk(status_updates)
+        for job_id in stale_job_ids:
+            self._remove_job_mapping(job_id)
 
         if synced > 0:
             logger.info(f"同步了 {synced} 个running任务状态")
@@ -692,9 +670,8 @@ class Manager:
         script_file.write_text(script_content)
         script_file.chmod(0o755)
 
-        # 提交前清理旧标记，保证文件状态唯一
+        # 提交前清理旧兼容标记和错误日志，success 标记保留为跳过依据
         clear_task_status(task_dir, self.config, remove_error_log=True)
-        (task_dir / '.running').touch()
 
         # 提交sbatch
         result = subprocess.run(
@@ -715,7 +692,6 @@ class Manager:
             return job_id
         else:
             logger.error(f"  提交失败: {task_dir.name}\n{result.stderr}")
-            (task_dir / '.running').unlink(missing_ok=True)
             return None
 
     def _save_job_mapping(self, job_id: str, task_path: Path):
@@ -779,17 +755,10 @@ class Manager:
 
             marker_status = self.get_task_status(task_dir)
             if marker_status == 'success':
-                clear_task_status(task_dir, self.config, statuses=['running'])
+                clear_task_status(task_dir, self.config, statuses=['running', 'failed'])
                 self.db.update_status(task_path_str, 'success')
                 logger.info(f"  跳过已完成任务: {task_path_str}")
                 continue
-            if marker_status == 'failed':
-                clear_task_status(task_dir, self.config, statuses=['running'])
-                self.db.update_status(task_path_str, 'failed')
-                logger.info(f"  跳过失败任务，等待 reset: {task_path_str}")
-                continue
-            if marker_status == 'running':
-                raise RuntimeError(f"待提交任务仍有 .running 标记，请先 reset: {task_path_str}")
 
             # 提交前实时生成VASP输入文件（INCAR/POTCAR/KPOINTS）
             task_type = task_data.get('task_type', 'opt')
@@ -1667,11 +1636,8 @@ class Manager:
         logger.info(f"Workflows: qha={self.enable_qha}, bte={self.enable_bte}")
         logger.info(f"Plain submit: {self.plain_submit}")
 
-        # 启动时仅恢复数据库中已跟踪任务的状态，不做全量目录扫描
-        if self.plain_submit:
-            self.reconcile_tracked_running_tasks()
-        else:
-            self.reconcile_tracked_tasks()
+        # 启动时仅恢复数据库中 running 的任务，不做全量状态回写
+        self.reconcile_tracked_running_tasks()
 
         # 备份计时器
         last_backup_time = time.time()

@@ -496,6 +496,25 @@ class TaskDB:
             conn.commit()
             return cursor.rowcount
 
+    def reset_success_tasks(self) -> int:
+        """将所有success任务重置为pending"""
+        now = datetime.now().isoformat()
+
+        with self._get_conn() as conn:
+            cursor = conn.execute('''
+                UPDATE tasks
+                SET status = 'pending',
+                    updated_at = ?,
+                    start_time = NULL,
+                    end_time = NULL,
+                    duration_seconds = NULL,
+                    slurm_job_id = NULL,
+                    error_message = NULL
+                WHERE status = 'success'
+            ''', (now,))
+            conn.commit()
+            return cursor.rowcount
+
     def reset_task_to_pending(self, task_path: str) -> bool:
         """将指定任务重置为pending状态"""
         now = datetime.now().isoformat()
@@ -610,8 +629,4 @@ class TaskDB:
         """从文件系统获取任务状态"""
         if (task_path / '.success').exists():
             return 'success'
-        if (task_path / '.failed').exists():
-            return 'failed'
-        if (task_path / '.running').exists():
-            return 'running'
         return 'pending'

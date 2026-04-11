@@ -52,10 +52,6 @@ class Worker:
             self._handle_failure(task_path, error_msg)
             return False
 
-        # 设置running状态
-        print(f"[STATUS] Setting .running flag: {task_path}", flush=True)
-        set_task_status(task_path, 'running', self.config)
-
         try:
             print(f"[EXEC] Executing {self.mode.upper()} in: {task_path}", flush=True)
             if self.mode == 'mattersim':
@@ -162,7 +158,7 @@ class Worker:
 
     def _handle_failure(self, task_path: str, error_msg: str):
         """处理任务失败"""
-        print(f"[STATUS] Setting .failed flag: {task_path}")
+        print(f"[STATUS] Recording failed task: {task_path}")
         set_task_status(task_path, 'failed', self.config, error_msg)
         print(f"[QUEUE] Moving to failed queue: {task_path}")
         self.queue.update_task_status(task_path, 'failed')

@@ -10,7 +10,7 @@ import signal
 import time
 from pathlib import Path
 
-from .utils import load_config, clear_task_status, get_status_files
+from .utils import load_config, clear_task_status
 from .template import generate_manager_script
 
 
@@ -216,60 +216,6 @@ def _remove_job_mappings(work_dir: Path, job_ids):
         jobs_file.write_text(json.dumps(job_mapping, indent=2))
 
 
-def _sync_tracked_running_tasks(config, db, work_dir: Path):
-    """轻量同步：仅检查数据库里 running 的任务。"""
-    running_tasks = db.get_running_tasks()
-    if not running_tasks:
-        return
-
-    active_jobs = set()
-    result = subprocess.run(
-        "squeue -u $USER -o '%.18i' -h",
-        shell=True,
-        capture_output=True,
-        text=True
-    )
-    if result.returncode == 0:
-        active_jobs = set(result.stdout.strip().split())
-
-    stale_job_ids = []
-    status_files = get_status_files(config)
-    failed_status_name = status_files['failed']
-    status_updates = []
-    pending_paths = []
-
-    for task_data in running_tasks:
-        task_path = task_data['path']
-        task_dir = work_dir / task_path
-        slurm_job_id = task_data.get('slurm_job_id')
-
-        if not task_dir.exists():
-            pending_paths.append(task_path)
-            stale_job_ids.append(slurm_job_id)
-            continue
-
-        if (task_dir / status_files['success']).exists():
-            clear_task_status(task_dir, config, statuses=['running'])
-            status_updates.append((task_path, 'success'))
-            stale_job_ids.append(slurm_job_id)
-        elif (task_dir / failed_status_name).exists():
-            clear_task_status(task_dir, config, statuses=['running'])
-            status_updates.append((task_path, 'failed'))
-            stale_job_ids.append(slurm_job_id)
-        elif not (task_dir / status_files['running']).exists():
-            pending_paths.append(task_path)
-            stale_job_ids.append(slurm_job_id)
-        elif active_jobs and slurm_job_id and slurm_job_id not in active_jobs:
-            clear_task_status(task_dir, config, statuses=['running'])
-            (task_dir / failed_status_name).touch()
-            status_updates.append((task_path, 'failed'))
-            stale_job_ids.append(slurm_job_id)
-
-    db.reset_tasks_to_pending_bulk(pending_paths)
-    db.update_status_bulk(status_updates)
-    _remove_job_mappings(work_dir, stale_job_ids)
-
-
 def cmd_manager(args):
     """Manager管理命令"""
     if args.action == 'run':
@@ -368,7 +314,6 @@ def cmd_status(args):
     from .task_db import TaskDB
 
     db = TaskDB(config, skip_backfill=True)
-    _sync_tracked_running_tasks(config, db, work_dir)
 
     # 如果指定了 --running，显示正在运行的任务
     if hasattr(args, 'show_running') and args.show_running:
@@ -580,8 +525,14 @@ def cmd_status(args):
     # 统计虚频结构数量
     structures_dir = (work_dir / config['manager']['structures_dir']).resolve()
     if structures_dir.exists():
-        imag_count = len(list(structures_dir.glob('*/.has_imag')))
-        total_structs = len([d for d in structures_dir.iterdir() if d.is_dir()])
+        imag_count = 0
+        total_structs = 0
+        for entry in os.scandir(structures_dir):
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            total_structs += 1
+            if (Path(entry.path) / '.has_imag').exists():
+                imag_count += 1
         if imag_count > 0:
             print(f"\n⚠ 存在虚频的结构: {imag_count}/{total_structs}")
 
@@ -631,6 +582,7 @@ def cmd_cancel(args):
     config = load_config()
     work_dir = Path(config.get('work_dir', '.')).resolve()
     jobs_file = work_dir / 'sbatch_jobs.json'
+    from .task_db import TaskDB
 
     # 1. 取消 manager
     if _cancel_manager():
@@ -670,22 +622,21 @@ def cmd_cancel(args):
     else:
         print(f"\n总共取消了 {cancelled} 个作业")
 
-    # 仅清理当前 manager 记录过的任务对应的 .running 标记
-    print("\n清理当前 manager 任务的 .running 标记...")
-    cleaned = 0
-    for rel_path in job_mapping.values():
-        task_dir = work_dir / rel_path
-        running_file = task_dir / '.running'
-        if running_file.exists():
-            running_file.unlink()
-            cleaned += 1
-
     if job_mapping:
-        remaining_jobs = {job_id: path for job_id, path in job_mapping.items() if job_id not in task_job_ids}
-        jobs_file.write_text(json.dumps(remaining_jobs, indent=2))
+        db = TaskDB(config, skip_backfill=True)
+        task_paths = []
+        for rel_path in dict.fromkeys(job_mapping.values()):
+            task_data = db.get_task(rel_path)
+            if task_data and task_data['status'] == 'running':
+                task_paths.append(rel_path)
 
-    if cleaned > 0:
-        print(f"  已清理 {cleaned} 个 .running 标记")
+        reset_count = db.reset_tasks_to_pending_bulk(task_paths)
+        for rel_path in task_paths:
+            task_dir = work_dir / rel_path
+            if task_dir.exists():
+                clear_task_status(task_dir, config, statuses=['running', 'failed'])
+        jobs_file.write_text(json.dumps({}, indent=2))
+        print(f"已将 {reset_count} 个任务重置为 pending")
 
 
 def cmd_reset(args):
@@ -705,7 +656,7 @@ def cmd_reset(args):
             print(f"错误: Manager正在远程运行 ({info})，请先执行 'qflow cancel' 停止Manager后再reset")
             return
 
-    db = TaskDB(config)
+    db = TaskDB(config, skip_backfill=True)
 
     if args.running:
         count = 0
@@ -714,7 +665,7 @@ def cmd_reset(args):
             task_dir = work_dir / task_data['path']
             if not task_dir.exists():
                 continue
-            removed = clear_task_status(task_dir, config, statuses=['running'])
+            removed = clear_task_status(task_dir, config, statuses=['running', 'failed'])
             if removed > 0:
                 count += 1
             stale_job_ids.append(task_data.get('slurm_job_id'))
@@ -723,7 +674,7 @@ def cmd_reset(args):
         db_count = db.reset_running_tasks()
         _remove_job_mappings(work_dir, stale_job_ids)
 
-        print(f"已清理 {count} 个 .running 标记")
+        print(f"已清理 {count} 个兼容状态标记")
         print(f"数据库更新: {db_count} 条记录")
 
     elif args.failed:
@@ -743,12 +694,30 @@ def cmd_reset(args):
         db_count = db.reset_failed_tasks()
         _remove_job_mappings(work_dir, stale_job_ids)
 
-        print(f"已清理 {count} 个 .failed 标记")
+        print(f"已清理 {count} 个兼容状态标记")
+        print(f"数据库更新: {db_count} 条记录")
+    elif args.success:
+        count = 0
+        stale_job_ids = []
+        for task_data in db.get_tasks(status='success'):
+            task_dir = work_dir / task_data['path']
+            if not task_dir.exists():
+                continue
+            removed = clear_task_status(task_dir, config, statuses=['success'])
+            if removed > 0:
+                count += 1
+            stale_job_ids.append(task_data.get('slurm_job_id'))
+
+        db_count = db.reset_success_tasks()
+        _remove_job_mappings(work_dir, stale_job_ids)
+
+        print(f"已清理 {count} 个 .success 标记")
         print(f"数据库更新: {db_count} 条记录")
     else:
         print("用法:")
         print("  qflow reset --running    # 重置running任务为pending")
         print("  qflow reset --failed     # 重置failed任务为pending")
+        print("  qflow reset --success    # 重置success任务为pending并删除.success")
 
 
 def cmd_regen(args):
@@ -1136,6 +1105,7 @@ def main():
   qflow sync                           # 同步任务队列
   qflow cancel                         # 取消所有manager和worker
   qflow reset --running                # 重置running任务为pending
+  qflow reset --success                # 重置success任务为pending
 '''
     )
     subparsers = parser.add_subparsers(dest='command', help='子命令')
@@ -1221,6 +1191,8 @@ def main():
                               help='将所有running状态的任务重置为pending')
     parser_reset.add_argument('--failed', action='store_true',
                               help='将所有failed状态的任务重置为pending（同时删除.failed文件）')
+    parser_reset.add_argument('--success', action='store_true',
+                              help='将所有success状态的任务重置为pending（同时删除.success文件）')
     parser_reset.set_defaults(func=cmd_reset)
 
     # regen子命令
