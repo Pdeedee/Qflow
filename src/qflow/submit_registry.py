@@ -109,6 +109,17 @@ class SubmitTaskScanner:
                 'pressure_name': None,
             }
 
+        path = Path(task_path)
+        if path.name.startswith('task.'):
+            structure_name = path.parent.name if path.parent != Path('.') else None
+            return {
+                'path': task_path,
+                'task_type': 'plain',
+                'structure_name': structure_name,
+                'volume_name': None,
+                'pressure_name': None,
+            }
+
         return None
 
     def iter_scan(self, plain_only: bool = False,
