@@ -4,7 +4,7 @@ import sqlite3
 import shutil
 from pathlib import Path
 from datetime import datetime
-from typing import Iterable, Optional, List, Dict
+from typing import Callable, Iterable, Optional, List, Dict
 from contextlib import contextmanager
 
 from .utils import load_config, get_task_type, parse_task_metadata
@@ -196,11 +196,13 @@ class TaskDB:
         added = conn.total_changes - before_changes
         return {'added': added, 'existing': len(rows) - added}
 
-    def add_tasks_ignore_existing(self, task_records: Iterable[Dict], batch_size: int = 10000) -> Dict[str, int]:
+    def add_tasks_ignore_existing(self, task_records: Iterable[Dict], batch_size: int = 10000,
+                                  progress_callback: Optional[Callable[[int, int, int], None]] = None) -> Dict[str, int]:
         """批量添加任务，仅插入新任务，不修改已有记录。"""
         totals = {'added': 0, 'existing': 0}
         now = datetime.now().isoformat()
         rows = []
+        processed = 0
 
         def build_row(record):
             task_path = record['path']
@@ -228,18 +230,23 @@ class TaskDB:
         with self._get_conn() as conn:
             for record in task_records:
                 rows.append(build_row(record))
+                processed += 1
                 if len(rows) < batch_size:
                     continue
 
                 counts = self._insert_task_rows_ignore_existing(conn, rows)
                 totals['added'] += counts['added']
                 totals['existing'] += counts['existing']
+                if progress_callback is not None:
+                    progress_callback(processed, totals['added'], totals['existing'])
                 rows = []
 
             if rows:
                 counts = self._insert_task_rows_ignore_existing(conn, rows)
                 totals['added'] += counts['added']
                 totals['existing'] += counts['existing']
+                if progress_callback is not None:
+                    progress_callback(processed, totals['added'], totals['existing'])
 
         return totals
 
