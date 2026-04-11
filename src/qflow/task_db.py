@@ -4,7 +4,7 @@ import sqlite3
 import shutil
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, List, Dict
+from typing import Iterable, Optional, List, Dict
 from contextlib import contextmanager
 
 from .utils import load_config, get_task_type, parse_task_metadata
@@ -178,23 +178,31 @@ class TaskDB:
             except sqlite3.IntegrityError:
                 return False
 
-    def add_tasks_ignore_existing(self, task_records: List[Dict]) -> Dict[str, int]:
-        """批量添加任务，仅插入新任务，不修改已有记录。"""
-        unique_records = []
-        seen_paths = set()
-        for record in task_records:
-            task_path = record['path']
-            if task_path in seen_paths:
-                continue
-            seen_paths.add(task_path)
-            unique_records.append(record)
-
-        if not unique_records:
+    def _insert_task_rows_ignore_existing(self, conn, rows) -> Dict[str, int]:
+        """批量写入任务行，仅插入新任务。"""
+        if not rows:
             return {'added': 0, 'existing': 0}
 
+        before_changes = conn.total_changes
+        conn.executemany('''
+            INSERT OR IGNORE INTO tasks (
+                path, task_type, structure_name, volume_name, pressure_name,
+                status, priority, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+        ''', rows)
+        conn.commit()
+
+        added = conn.total_changes - before_changes
+        return {'added': added, 'existing': len(rows) - added}
+
+    def add_tasks_ignore_existing(self, task_records: Iterable[Dict], batch_size: int = 10000) -> Dict[str, int]:
+        """批量添加任务，仅插入新任务，不修改已有记录。"""
+        totals = {'added': 0, 'existing': 0}
         now = datetime.now().isoformat()
         rows = []
-        for record in unique_records:
+
+        def build_row(record):
             task_path = record['path']
             task_type = record.get('task_type')
             metadata = {
@@ -210,28 +218,30 @@ class TaskDB:
                     'pressure_name': metadata['pressure_name'] or parsed_metadata['pressure_name'],
                 }
 
-            rows.append(
-                self._build_task_insert_row(
-                    task_path,
-                    task_type=task_type,
-                    metadata=metadata,
-                    now=now,
-                )
+            return self._build_task_insert_row(
+                task_path,
+                task_type=task_type,
+                metadata=metadata,
+                now=now,
             )
 
         with self._get_conn() as conn:
-            before_changes = conn.total_changes
-            conn.executemany('''
-                INSERT OR IGNORE INTO tasks (
-                    path, task_type, structure_name, volume_name, pressure_name,
-                    status, priority, created_at, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
-            ''', rows)
-            conn.commit()
+            for record in task_records:
+                rows.append(build_row(record))
+                if len(rows) < batch_size:
+                    continue
 
-            added = conn.total_changes - before_changes
-            return {'added': added, 'existing': len(rows) - added}
+                counts = self._insert_task_rows_ignore_existing(conn, rows)
+                totals['added'] += counts['added']
+                totals['existing'] += counts['existing']
+                rows = []
+
+            if rows:
+                counts = self._insert_task_rows_ignore_existing(conn, rows)
+                totals['added'] += counts['added']
+                totals['existing'] += counts['existing']
+
+        return totals
 
     def get_pending_task(self) -> Optional[Dict]:
         """获取优先级最高的pending任务并标记为running"""

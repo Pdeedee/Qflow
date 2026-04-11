@@ -983,7 +983,7 @@ def cmd_sync(args):
         structures_dir = (work_dir / config['manager']['structures_dir']).resolve()
         plain_submit = config.get('manager', {}).get('plain_submit', False)
         scanner = SubmitTaskScanner(work_dir, structures_dir)
-        synced_counts = db.add_tasks_ignore_existing(scanner.scan(plain_only=plain_submit))
+        synced_counts = db.add_tasks_ignore_existing(scanner.iter_scan(plain_only=plain_submit))
         return db, synced_counts
 
     if running and manager_mode != 'local':

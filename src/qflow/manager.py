@@ -1621,8 +1621,6 @@ class Manager:
 
         # 启动时仅恢复数据库中已跟踪任务的状态，不做全量目录扫描
         self.reconcile_tracked_tasks()
-        if self.plain_submit:
-            self.sync_plain_submit_tasks()
 
         # 备份计时器
         last_backup_time = time.time()
@@ -1636,9 +1634,7 @@ class Manager:
             self.sync_task_times()
 
             # 3. 任务准备
-            if self.plain_submit:
-                self.sync_plain_submit_tasks()
-            else:
+            if not self.plain_submit:
                 self.generate_opt_tasks()
 
                 if self.enable_qha:

@@ -3,7 +3,7 @@
 import os
 import re
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional
 
 
 class SubmitTaskScanner:
@@ -111,11 +111,10 @@ class SubmitTaskScanner:
 
         return None
 
-    def scan(self, plain_only: bool = False) -> List[Dict]:
+    def iter_scan(self, plain_only: bool = False) -> Iterable[Dict]:
         """使用 os.scandir 递归扫描候选任务目录。"""
-        records = []
         if not self.structures_dir.exists():
-            return records
+            return
 
         scan_stack = [self.structures_dir]
         while scan_stack:
@@ -125,14 +124,14 @@ class SubmitTaskScanner:
                     continue
 
                 if self.is_submit_candidate_name(entry.name, plain_only):
-                    poscar_path = Path(entry.path) / 'POSCAR'
-                    if poscar_path.exists():
-                        rel_path = Path(entry.path).relative_to(self.work_dir).as_posix()
-                        record = self._classify_submit_candidate(rel_path)
-                        if record is not None:
-                            records.append(record)
+                    rel_path = Path(entry.path).relative_to(self.work_dir).as_posix()
+                    record = self._classify_submit_candidate(rel_path)
+                    if record is not None:
+                        yield record
                     continue
 
                 scan_stack.append(Path(entry.path))
 
-        return records
+    def scan(self, plain_only: bool = False) -> List[Dict]:
+        """返回扫描结果列表。"""
+        return list(self.iter_scan(plain_only=plain_only))
