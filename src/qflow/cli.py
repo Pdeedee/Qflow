@@ -362,7 +362,7 @@ def cmd_status(args):
     work_dir = Path(config.get('work_dir', '.')).resolve()
     from .task_db import TaskDB
 
-    db = TaskDB(config)
+    db = TaskDB(config, skip_backfill=True)
     _sync_tracked_running_tasks(config, db, work_dir)
 
     # 如果指定了 --running，显示正在运行的任务

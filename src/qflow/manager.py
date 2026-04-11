@@ -100,7 +100,7 @@ class Manager:
 
         # SQLite任务数据库
         logger.info("正在初始化任务数据库...")
-        self.db = TaskDB(config)
+        self.db = TaskDB(config, skip_backfill=self.plain_submit)
         self.submit_scanner = SubmitTaskScanner(self.work_dir, self.structures_dir)
 
         # 标记已处理的结构，避免重复

@@ -25,10 +25,11 @@ class TaskDB:
         'plain': 20,
     }
 
-    def __init__(self, config: dict = None):
+    def __init__(self, config: dict = None, skip_backfill: bool = False):
         if config is None:
             config = load_config()
         self.config = config
+        self.skip_backfill = skip_backfill
 
         work_dir = Path(config.get('work_dir', '.')).resolve()
         self.db_path = work_dir / 'tasks.db'
@@ -70,7 +71,8 @@ class TaskDB:
             conn.execute('CREATE INDEX IF NOT EXISTS idx_pressure_name ON tasks(pressure_name)')
             conn.commit()
 
-        self._backfill_task_metadata()
+        if not self.skip_backfill:
+            self._backfill_task_metadata()
 
     def _ensure_column(self, conn, table_name: str, column_name: str, column_def: str):
         """确保表包含指定列。"""
