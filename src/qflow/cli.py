@@ -364,6 +364,7 @@ def cmd_status(args):
     """显示任务状态 - 基于数据库快速返回"""
     config = load_config()
     work_dir = Path(config.get('work_dir', '.')).resolve()
+    plain_submit = config.get('manager', {}).get('plain_submit', False)
     from .task_db import TaskDB
 
     db = TaskDB(config, skip_backfill=True)
@@ -512,6 +513,35 @@ def cmd_status(args):
     raw_stats = db.get_statistics()
     stats = _aggregate_statistics(raw_stats)
     failed_tasks_list = [task['path'] for task in db.get_tasks(status='failed', limit=5)]
+
+    if plain_submit:
+        counts = raw_stats.get('plain', {'pending': 0, 'running': 0, 'success': 0, 'failed': 0})
+        total = sum(counts.values())
+
+        print()
+        print("┌──────────────┬─────────┬─────────┬─────────┬─────────┐")
+        print("│ Plain Tasks  │ Pending │ Running │ Success │ Failed  │")
+        print("├──────────────┼─────────┼─────────┼─────────┼─────────┤")
+        print(f"│ {'Total':<12} │ {counts['pending']:>7} │ {counts['running']:>7} │ {counts['success']:>7} │ {counts['failed']:>7} │")
+        print("└──────────────┴─────────┴─────────┴─────────┴─────────┘")
+        print(f"\nTracked plain tasks: {total}")
+
+        avg_times = {}
+        for task_data in db.get_recent_completed(hours=6):
+            task_type = task_data.get('task_type', 'unknown')
+            avg_times.setdefault(task_type, []).append(task_data['duration_seconds'])
+
+        if avg_times.get('plain'):
+            avg_min = sum(avg_times['plain']) / len(avg_times['plain']) / 60
+            print(f"\n最近6小时平均执行时间:\n  plain: {avg_min:.1f} min (样本: {len(avg_times['plain'])})")
+
+        if failed_tasks_list:
+            print("\nRecent failed tasks:")
+            for path in failed_tasks_list[:5]:
+                print(f"  - {path}")
+
+        print()
+        return
 
     # 任务类型显示名称映射
     type_names = {
