@@ -523,6 +523,54 @@ class Manager:
         )
         return recovered
 
+    def reconcile_tracked_running_tasks(self):
+        """plain_submit 启动恢复：只处理数据库中 running 的任务。"""
+        logger.info("=== 恢复运行中任务状态 ===")
+
+        recovered = {
+            'success': 0,
+            'failed': 0,
+            'pending': 0,
+            'removed': 0,
+        }
+
+        for task_data in self.db.get_running_tasks():
+            task_path_str = task_data['path']
+            task_dir = self.work_dir / task_path_str
+            slurm_job_id = task_data.get('slurm_job_id')
+
+            if not task_dir.exists():
+                self.db.reset_task_to_pending(task_path_str)
+                self._remove_job_mapping(slurm_job_id)
+                recovered['removed'] += 1
+                continue
+
+            fs_status = self.get_task_status(task_dir)
+
+            if fs_status == 'success':
+                clear_task_status(task_dir, self.config, statuses=['running'])
+                self.db.update_status(task_path_str, 'success')
+                self._remove_job_mapping(slurm_job_id)
+                recovered['success'] += 1
+            elif fs_status == 'failed':
+                clear_task_status(task_dir, self.config, statuses=['running'])
+                self.db.update_status(task_path_str, 'failed')
+                self._remove_job_mapping(slurm_job_id)
+                recovered['failed'] += 1
+            elif fs_status in ('pending', 'not_ready'):
+                self.db.reset_task_to_pending(task_path_str)
+                self._remove_job_mapping(slurm_job_id)
+                recovered['pending'] += 1
+
+        logger.info(
+            "已恢复运行中任务状态: "
+            f"success={recovered['success']}, "
+            f"failed={recovered['failed']}, "
+            f"pending={recovered['pending']}, "
+            f"removed={recovered['removed']}"
+        )
+        return recovered
+
     def sync_running_tasks_status(self):
         """快速同步：只检查running任务的文件系统状态"""
         synced = 0
@@ -1620,7 +1668,10 @@ class Manager:
         logger.info(f"Plain submit: {self.plain_submit}")
 
         # 启动时仅恢复数据库中已跟踪任务的状态，不做全量目录扫描
-        self.reconcile_tracked_tasks()
+        if self.plain_submit:
+            self.reconcile_tracked_running_tasks()
+        else:
+            self.reconcile_tracked_tasks()
 
         # 备份计时器
         last_backup_time = time.time()
