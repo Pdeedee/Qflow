@@ -183,11 +183,15 @@ def record_failed_task(task_path: str, config: dict):
 def get_task_type(task_path: str) -> str:
     """
     根据任务路径判断任务类型
-    返回: 'opt', 'qha_opt', 'phonon', 'qha', 'bte_fc2', 'bte_fc3'
+    返回: 'opt', 'qha_opt', 'phonon', 'qha', 'bte_opt', 'bte_fc2', 'bte_fc3', 'bte_postprocess'
     """
     path = Path(task_path)
     path_str = str(path)
     is_task_dir = path.name.startswith('task.')
+
+    # BTE 后处理任务: bte/analyze/task.BTE
+    if re.search(rf'{re.escape(os.sep)}bte{re.escape(os.sep)}analyze{re.escape(os.sep)}task\.BTE$', path_str):
+        return 'bte_postprocess'
 
     # BTE 任务
     if '/bte/fc2/' in path_str and is_task_dir:

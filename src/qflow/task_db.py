@@ -169,6 +169,7 @@ class TaskDB:
         'phonon': 50,
         'bte_fc2': 45,   # BTE fc2 位移单点
         'bte_fc3': 40,   # BTE fc3 位移单点
+        'bte_postprocess': 35,  # BTE 热导率后处理
         'qha': 30,
         'plain': 20,
     }
@@ -426,6 +427,7 @@ class TaskDB:
             'bte_opt': 'bte_opt_generated',
             'bte_fc2': 'bte_fc2_generated',
             'bte_fc3': 'bte_fc3_generated',
+            'bte_postprocess': 'bte_postprocess_generated',
             'plain': 'plain_generated',
         }
 

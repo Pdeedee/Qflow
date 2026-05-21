@@ -174,7 +174,7 @@ def _task_type_to_stage(task_type: str) -> str:
         return 'phonon'
     if task_type in ('qha_opt', 'qha'):
         return 'qha'
-    if task_type in ('bte_opt', 'bte_fc2', 'bte_fc3'):
+    if task_type in ('bte_opt', 'bte_fc2', 'bte_fc3', 'bte_postprocess'):
         return 'bte'
     return 'other'
 

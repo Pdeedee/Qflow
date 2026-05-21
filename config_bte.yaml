@@ -1,5 +1,5 @@
-# BTE 热导率验证计算 - 专用配置
-# 使用 VASP r2SCAN 验证 MatterSim BTE 结果
+# BTE 热导率验证计算配置
+# 工作目录请放在 /data/bte_vasp，结构目录为 ./bte_structures
 
 work_dir: .
 
@@ -7,8 +7,10 @@ manager:
   structures_dir: ./bte_structures
   scan_interval: 10
   task_timeout: 7200
+  max_workers: 8
   qha: false
   bte: true
+  plain_submit: false
 
 worker:
   mode: vasp
@@ -22,6 +24,11 @@ slurm:
   time: "24:00:00"
   task_time: "24:00:00"
   mem: "64G"
+  python_path: /data/software/miniforge3/envs/mattersim/bin/python
+  module_init_script: null
+  modules: []
+  extra_commands:
+    - export LD_LIBRARY_PATH=/home/share/apps/openmpi-5.0.7/lib:/home/share/apps/scalapack-2.2.2/lib:/home/share/apps/fftw-3.3.10/lib:/home/share/apps/openblas/lib:$LD_LIBRARY_PATH
 
 opt:
   fmax: 0.01
@@ -41,10 +48,12 @@ failure:
 
 task_types:
   opt: "opt"
+  bte_opt: "bte_opt"
   bte_fc2: "bte_fc2"
   bte_fc3: "bte_fc3"
+  bte_postprocess: "bte_postprocess"
 
-# 声子配置（BTE 模式不用，但保留避免报错）
+# 声子配置（BTE 模式下保留以满足代码读取）
 phonon:
   supercell: null
   max_atoms: 100
@@ -60,9 +69,8 @@ qha:
   t_max: 800
   t_step: 10
 
-# BTE (phono3py) 配置
 bte:
-  pressures: [0, 10, 20, 30, 40, 50, 60, 70, 80]  # 压强点 (GPa)
+  pressures: [0, 10, 20, 30, 40, 50, 60, 70, 80]
   supercell: null
   max_atoms: null
   min_atoms: 100
@@ -77,7 +85,6 @@ bte:
   target_length: 60.0
   max_mesh: 24
 
-# VASP INCAR 设置
 vasp_sets:
   opt: mprelax
   qha_opt: mprelax
@@ -86,7 +93,6 @@ vasp_sets:
   plain: matpes
 
 incar:
-  # r2SCAN 结构优化
   opt:
     ALGO: Normal
     EDIFF: 1.0e-07
@@ -98,12 +104,12 @@ incar:
     ISPIN: 1
     ISTART: 0
     KSPACING: 0.22
-    LASPH: True
-    LCHARG: False
+    LASPH: true
+    LCHARG: false
     LMAXMIX: 6
-    LMIXTAU: True
-    LREAL: False
-    LWAVE: False
+    LMIXTAU: true
+    LREAL: false
+    LWAVE: false
     METAGGA: R2scan
     NELM: 200
     NELMIN: 6
@@ -111,7 +117,6 @@ incar:
     PREC: Accurate
     SIGMA: 0.05
 
-  # r2SCAN 单点（fc2/fc3 位移力计算）
   phonon:
     ALGO: Normal
     EDIFF: 1.0e-08
@@ -122,12 +127,12 @@ incar:
     ISPIN: 1
     ISTART: 0
     KSPACING: 0.22
-    LASPH: True
-    LCHARG: False
+    LASPH: true
+    LCHARG: false
     LMAXMIX: 6
-    LMIXTAU: True
-    LREAL: False
-    LWAVE: False
+    LMIXTAU: true
+    LREAL: false
+    LWAVE: false
     METAGGA: R2scan
     NELM: 200
     NELMIN: 6
@@ -145,12 +150,12 @@ incar:
     ISPIN: 1
     ISTART: 0
     KSPACING: 0.22
-    LASPH: True
-    LCHARG: False
+    LASPH: true
+    LCHARG: false
     LMAXMIX: 6
-    LMIXTAU: True
-    LREAL: False
-    LWAVE: False
+    LMIXTAU: true
+    LREAL: false
+    LWAVE: false
     METAGGA: R2scan
     NELM: 200
     NELMIN: 6

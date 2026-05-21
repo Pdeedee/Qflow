@@ -19,6 +19,9 @@ class SubmitTaskScanner:
         self._bte_task_pattern = re.compile(
             rf"{base}/(?P<pressure_name>P_\d+GPa)/bte/(?P<fc>fc2|fc3)/(?P<task_name>task\.[^/]+)$"
         )
+        self._bte_postprocess_pattern = re.compile(
+            rf"{base}/(?P<pressure_name>P_\d+GPa)/bte/analyze/task\.BTE$"
+        )
         self._bte_opt_pattern = re.compile(
             rf"{base}/(?P<pressure_name>P_\d+GPa)/opt$"
         )
@@ -42,6 +45,17 @@ class SubmitTaskScanner:
 
     def _classify_submit_candidate(self, task_path: str) -> Optional[Dict]:
         normalized_path = task_path.replace(os.sep, '/')
+
+        match = self._bte_postprocess_pattern.match(normalized_path)
+        if match:
+            data = match.groupdict()
+            return {
+                'path': task_path,
+                'task_type': 'bte_postprocess',
+                'structure_name': data['structure_name'],
+                'volume_name': None,
+                'pressure_name': data['pressure_name'],
+            }
 
         match = self._bte_task_pattern.match(normalized_path)
         if match:

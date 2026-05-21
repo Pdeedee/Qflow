@@ -113,7 +113,8 @@ cd {work_dir}
     return script
 
 
-def generate_task_script(config: dict, task_name: str = "qflow_task") -> str:
+def generate_task_script(config: dict, task_name: str = "qflow_task",
+                         task_type: str = "vasp") -> str:
     """生成任务执行的SLURM脚本（在任务目录中执行）
 
     Args:
@@ -125,6 +126,8 @@ def generate_task_script(config: dict, task_name: str = "qflow_task") -> str:
     """
     slurm_config = config.get('slurm', {})
     worker_config = config.get('worker', {})
+    work_dir = Path(config.get('work_dir', '.')).resolve()
+    config_path = work_dir / 'config.yaml'
 
     # 获取基本配置
     nodes = slurm_config.get('nodes', 1)
@@ -132,6 +135,7 @@ def generate_task_script(config: dict, task_name: str = "qflow_task") -> str:
     partition = slurm_config.get('partition', 'cpu')
     time_limit = slurm_config.get('task_time', '24:00:00')  # 单个任务默认1天
     vasp_cmd = worker_config.get('vasp_cmd', 'mpirun vasp_std')
+    python_path = slurm_config.get('python_path') or sys.executable
 
     # timeout设置为SLURM时间限制的90%（留余量给清理工作）
     # 解析time_limit为秒数
@@ -141,6 +145,8 @@ def generate_task_script(config: dict, task_name: str = "qflow_task") -> str:
         timeout = int((hours * 3600 + mins * 60 + secs) * 0.95)
     else:
         timeout = 82800  # 默认23小时
+
+    task_log = 'bte_postprocess.log' if task_type == 'bte_postprocess' else 'vasp.log'
 
     # 可选的SBATCH参数
     optional_params = ""
@@ -177,6 +183,52 @@ fi
             env_section += f"{cmd}\n"
         env_section += "\n"
 
+    if task_type == 'bte_postprocess':
+        execution_section = f"""# 执行BTE后处理
+echo "Executing BTE postprocess with timeout {timeout}s..."
+echo "Command: {python_path} (qflow.phonon_utils.postprocess_bte)"
+
+set +e
+timeout {timeout} {python_path} - <<'PY' > {task_log} 2>&1
+from pathlib import Path
+
+from qflow.phonon_utils import postprocess_bte
+from qflow.utils import load_config
+
+config = load_config({str(config_path)!r})
+task_dir = Path.cwd()
+bte_dir = task_dir.parent.parent
+bte_cfg = config.get('bte', {{}})
+worker_mode = config.get('worker', {{}}).get('mode', 'mattersim')
+
+result = postprocess_bte(
+    bte_dir=str(bte_dir),
+    tmin=bte_cfg.get('tmin', 50),
+    tmax=bte_cfg.get('tmax', 500),
+    tstep=bte_cfg.get('tstep', 50),
+    method=bte_cfg.get('method', 'RTA'),
+    is_isotope=bte_cfg.get('is_isotope', True),
+    target_length=bte_cfg.get('target_length', 60.0),
+    max_mesh=bte_cfg.get('max_mesh', 24),
+    use_vasprun=(worker_mode == 'vasp'),
+)
+print("BTE postprocess finished")
+PY
+EXIT_CODE=$?
+set -e
+"""
+    else:
+        execution_section = f"""# 执行VASP
+echo "Executing VASP with timeout {timeout}s..."
+echo "Command: {vasp_cmd}"
+
+# 执行并捕获退出码
+set +e
+timeout {timeout} bash -c '{vasp_cmd}' > {task_log} 2>&1
+EXIT_CODE=$?
+set -e
+"""
+
     script = f"""#!/bin/bash
 #SBATCH --job-name={task_name}
 #SBATCH --nodes={nodes}
@@ -204,28 +256,20 @@ echo "$START_TIME_ISO" > .start_time
 cleanup() {{
     echo "SIGNAL received, marking task as failed at $(date)"
     echo "Task killed by signal at $(date)" > error.log
-    tail -100 vasp.log >> error.log 2>/dev/null || true
+    tail -100 {task_log} >> error.log 2>/dev/null || true
     rm -f .success
     exit 1
 }}
 trap cleanup SIGTERM SIGINT SIGHUP
 
-# 执行VASP
-echo "Executing VASP with timeout {timeout}s..."
-echo "Command: {vasp_cmd}"
-
-# 执行并捕获退出码
-set +e
-timeout {timeout} bash -c '{vasp_cmd}' > vasp.log 2>&1
-EXIT_CODE=$?
-set -e
+{execution_section}
 
 # 记录结束时间
 END_TIME=$(date +%s)
 END_TIME_ISO=$(date -Iseconds)
 DURATION=$((END_TIME - START_TIME))
 
-echo "VASP finished with exit code: $EXIT_CODE"
+echo "Task finished with exit code: $EXIT_CODE"
 echo "Duration: $DURATION seconds"
 
 # 写入任务时间记录
@@ -239,19 +283,27 @@ EOF
 # 设置任务状态
 if [ $EXIT_CODE -eq 124 ]; then
     # timeout退出码124表示超时
-    echo "ERROR: VASP execution timeout"
-    echo "VASP execution timeout after {timeout}s at $(date)" > error.log
+    echo "ERROR: task execution timeout"
+    echo "Task execution timeout after {timeout}s at $(date)" > error.log
     echo "status: timeout" >> .task_time
     rm -f .success
     exit 1
 elif [ $EXIT_CODE -ne 0 ]; then
-    echo "ERROR: VASP failed with exit code $EXIT_CODE"
-    echo "VASP failed with exit code $EXIT_CODE at $(date)" > error.log
-    tail -100 vasp.log >> error.log 2>/dev/null || true
+    echo "ERROR: task failed with exit code $EXIT_CODE"
+    echo "Task failed with exit code $EXIT_CODE at $(date)" > error.log
+    tail -100 {task_log} >> error.log 2>/dev/null || true
     echo "status: failed" >> .task_time
     rm -f .success
     exit 1
 else
+    if [ "{task_type}" = "bte_postprocess" ]; then
+        echo "SUCCESS: BTE postprocessing completed successfully"
+        echo "status: success" >> .task_time
+        rm -f .failed .running
+        touch .success
+        exit 0
+    fi
+
     if [ -f vasprun.xml ]; then
         python - <<'PY'
 import sys

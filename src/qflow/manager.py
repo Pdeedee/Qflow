@@ -5,6 +5,7 @@ import time
 import json
 import shutil
 import subprocess
+import re
 from pathlib import Path
 from typing import Iterable, List, Set, Optional, Dict, Tuple
 from datetime import datetime
@@ -30,7 +31,6 @@ from .phonon_utils import (
     postprocess_qha,
     get_missing_qha_static_energy_volumes,
     generate_bte_displacements,
-    postprocess_bte,
 )
 
 logger.info("正在加载 pymatgen...")
@@ -125,7 +125,7 @@ class Manager:
         self._phonon_postprocessed: Set[str] = set()
         self._qha_postprocessed: Set[str] = set()
         self._bte_generated: Set[str] = set()
-        self._bte_postprocessed: Set[str] = set()
+        self._bte_postprocess_generated: Set[str] = set()
         self._postprocess_failures: Set[str] = set()
 
         logger.info("Manager 初始化完成")
@@ -798,6 +798,16 @@ class Manager:
         if 'opt' in parts:
             return f"opt_{mp_id}" if mp_id else "opt_task"
 
+        if 'task.BTE' in parts:
+            pressure = None
+            for part in parts:
+                if re.match(r'P_\d+GPa', part):
+                    pressure = part
+                    break
+            if mp_id and pressure:
+                return f"btepost_{mp_id}_{pressure}"
+            return "btepost_task"
+
         # BTE任务
         if 'bte' in parts:
             fc_type = None
@@ -825,7 +835,7 @@ class Manager:
 
         return "qflow_task"
 
-    def submit_sbatch_task(self, task_dir: Path) -> Optional[str]:
+    def submit_sbatch_task(self, task_dir: Path, task_type: str = 'opt') -> Optional[str]:
         """为任务生成sbatch脚本并提交
 
         Returns: job_id或None（失败时）
@@ -834,7 +844,7 @@ class Manager:
         task_name = self._generate_task_name(task_dir)
 
         # 生成sbatch脚本
-        script_content = generate_task_script(self.config, task_name)
+        script_content = generate_task_script(self.config, task_name, task_type=task_type)
 
         # 写入脚本文件到任务目录
         script_file = task_dir / 'run.sbatch'
@@ -937,7 +947,8 @@ class Manager:
             task_path_str = task_data['path']
             task_dir = self.work_dir / task_path_str
 
-            if not task_dir.exists() or not (task_dir / 'POSCAR').exists():
+            requires_poscar = task_data.get('task_type') != 'bte_postprocess'
+            if not task_dir.exists() or (requires_poscar and not (task_dir / 'POSCAR').exists()):
                 # 任务目录不存在，标记为failed
                 self.db.update_status(task_path_str, 'failed')
                 logger.warning(f"  任务目录不存在，标记为failed: {task_path_str}")
@@ -958,11 +969,11 @@ class Manager:
                 'qha': 'phonon', 'plain': 'plain',
             }
             vasp_type = vasp_type_map.get(task_type, 'phonon')
-            if self.worker_mode == 'vasp':
+            if self.worker_mode == 'vasp' and task_type != 'bte_postprocess':
                 self._generate_vasp_inputs(task_dir, task_type=vasp_type)
 
             # 提交sbatch任务
-            job_id = self.submit_sbatch_task(task_dir)
+            job_id = self.submit_sbatch_task(task_dir, task_type=task_type)
             if job_id:
                 self.db.update_status(task_path_str, 'running', slurm_job_id=job_id)
                 submitted += 1
@@ -1690,7 +1701,7 @@ class Manager:
         return len(missing_volumes) == 0, missing_volumes
 
     # ========== BTE 工作流 ==========
-    # 流程: opt(0GPa) → P_XXGPa/opt(带PSTRESS) → fc2 → 虚频检查 → fc3 → BTE后处理
+    # 流程: opt(0GPa) → P_XXGPa/opt(带PSTRESS) → fc2 → 虚频检查 → fc3 → task.BTE → BTE后处理
     # 每个压强点独立: fc2完成后先检查虚频，有虚频则跳过fc3
 
     def _get_bte_pressures(self):
@@ -1901,24 +1912,31 @@ class Manager:
         task_type = 'bte_fc2' if fc_dir.name == 'fc2' else 'bte_fc3'
         return self._check_registered_submit_tasks_completed(fc_dir, task_type)
 
-    def run_bte_postprocess(self):
-        """BTE 后处理（每个压强点独立）"""
+    def generate_bte_postprocess_tasks(self):
+        """BTE 后处理任务（每个压强点独立）"""
         if not self.enable_bte:
             return
+
+        logger.info("=== 生成BTE后处理任务 ===")
 
         for struct_dir in self.get_all_structures():
             for pressure in self._get_bte_pressures():
                 p_dir = struct_dir / f'P_{pressure:02d}GPa'
-                post_marker = self._postprocess_marker(struct_dir, f'bte__{p_dir.name}')
-                if post_marker.exists():
-                    continue
                 bte_dir = p_dir / 'bte'
+                analyze_dir = bte_dir / 'analyze'
+                task_dir = analyze_dir / 'task.BTE'
+                post_marker = self._generation_marker(struct_dir, f'bte_post__{p_dir.name}')
+                if post_marker.exists():
+                    if task_dir.exists() or self._get_db_task(task_dir):
+                        self._bte_postprocess_generated.add(cache_key)
+                        continue
+                    post_marker.unlink()
 
                 if not bte_dir.exists():
                     continue
 
                 cache_key = f"{struct_dir.name}_P{pressure}"
-                if cache_key in self._bte_postprocessed:
+                if cache_key in self._bte_postprocess_generated:
                     continue
 
                 # fc2 + fc3 都完成才做后处理
@@ -1926,41 +1944,25 @@ class Manager:
                         self._check_fc_completed(bte_dir / 'fc3')):
                     continue
 
-                analyze_dir = bte_dir / 'analyze'
-                if (analyze_dir / 'kappa_summarize.dat').exists():
+                if task_dir.exists():
+                    task_path = str(task_dir.relative_to(self.work_dir))
+                    self.db.add_task(task_path, 'bte_postprocess')
                     post_marker.touch()
-                    self._bte_postprocessed.add(cache_key)
+                    self._bte_postprocess_generated.add(cache_key)
                     continue
 
-                logger.info(f"[BTE POSTPROCESS] {struct_dir.name} P={pressure}GPa ...")
+                logger.info(f"  创建 BTE 后处理任务: {struct_dir.name} P={pressure}GPa")
+                analyze_dir.mkdir(parents=True, exist_ok=True)
+                task_dir.mkdir(exist_ok=True)
 
-                orig_dir = os.getcwd()
-                bte_cfg = self.bte_config
-                use_vasprun = (self.worker_mode == 'vasp')
-                try:
-                    os.chdir(str(analyze_dir))
-                    result = postprocess_bte(
-                        bte_dir=str(bte_dir),
-                        tmin=bte_cfg.get('tmin', 50),
-                        tmax=bte_cfg.get('tmax', 500),
-                        tstep=bte_cfg.get('tstep', 50),
-                        method=bte_cfg.get('method', 'RTA'),
-                        is_isotope=bte_cfg.get('is_isotope', True),
-                        target_length=bte_cfg.get('target_length', 60.0),
-                        max_mesh=bte_cfg.get('max_mesh', 24),
-                        use_vasprun=use_vasprun,
-                    )
-                finally:
-                    os.chdir(orig_dir)
-
-                if result['has_imaginary']:
-                    logger.warning(f"  {struct_dir.name} P={pressure}GPa: 虚频 (min={result['min_freq']:.4f} THz)")
-                else:
-                    logger.info(f"  {struct_dir.name} P={pressure}GPa: kappa(300K) = {result['kappa_300K']:.2f} W/mK")
-
-                (bte_dir / '.bte_done').touch()
+                task_path = str(task_dir.relative_to(self.work_dir))
+                self.db.add_task(task_path, 'bte_postprocess')
                 post_marker.touch()
-                self._bte_postprocessed.add(cache_key)
+                self._bte_postprocess_generated.add(cache_key)
+
+    def run_bte_postprocess(self):
+        """兼容旧入口：仅生成 BTE 后处理任务。"""
+        self.generate_bte_postprocess_tasks()
 
     def _print_stats(self, stats: dict):
         """打印统计信息"""
@@ -1993,6 +1995,7 @@ class Manager:
             self.generate_bte_pressure_opt_tasks()
             self.generate_bte_tasks()
             self.generate_bte_fc3_tasks()
+            self.generate_bte_postprocess_tasks()
 
         return self.collect_statistics()
 
@@ -2030,9 +2033,6 @@ class Manager:
             if not self.plain_submit:
                 if self.enable_qha:
                     self.run_postprocess()
-
-                if self.enable_bte:
-                    self.run_bte_postprocess()
 
             # 6. 打印统计信息
             stats = self.collect_statistics()
