@@ -17,13 +17,13 @@ class SubmitTaskScanner:
         base = rf"^{re.escape(structures_relpath)}/(?P<structure_name>[^/]+)"
 
         self._bte_task_pattern = re.compile(
-            rf"{base}/(?P<pressure_name>P_\d+GPa)/bte/(?P<fc>fc2|fc3)/(?P<task_name>task\.[^/]+|task_perfect)$"
+            rf"{base}/(?P<pressure_name>P_\d+GPa)/bte/(?P<fc>fc2|fc3)/(?P<task_name>task\.[^/]+)$"
         )
         self._bte_opt_pattern = re.compile(
             rf"{base}/(?P<pressure_name>P_\d+GPa)/opt$"
         )
         self._volume_task_pattern = re.compile(
-            rf"{base}/(?P<volume_name>volume_[^/]+)/(?P<task_name>task\.[^/]+|task_perfect)$"
+            rf"{base}/(?P<volume_name>volume_[^/]+)/(?P<task_name>task\.[^/]+)$"
         )
         self._volume_opt_pattern = re.compile(
             rf"{base}/(?P<volume_name>volume_[^/]+)/opt$"
@@ -32,13 +32,13 @@ class SubmitTaskScanner:
             rf"{base}(?:/[^/]+)*/opt$"
         )
         self._plain_task_pattern = re.compile(
-            rf"{base}(?:/[^/]+)*/(?P<task_name>task\.[^/]+|task_perfect)$"
+            rf"{base}(?:/[^/]+)*/(?P<task_name>task\.[^/]+)$"
         )
 
     def is_submit_candidate_name(self, name: str, plain_only: bool) -> bool:
         if plain_only:
             return name.startswith('task.')
-        return name == 'opt' or name == 'task_perfect' or name.startswith('task.')
+        return name == 'opt' or name.startswith('task.')
 
     def _classify_submit_candidate(self, task_path: str) -> Optional[Dict]:
         normalized_path = task_path.replace(os.sep, '/')

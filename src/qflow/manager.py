@@ -6,7 +6,7 @@ import json
 import shutil
 import subprocess
 from pathlib import Path
-from typing import List, Set, Optional, Dict
+from typing import Iterable, List, Set, Optional, Dict, Tuple
 from datetime import datetime
 
 from .logger import logger
@@ -21,13 +21,14 @@ from .utils import (
     clear_task_status,
 )
 from .template import generate_task_script
-from .task_db import TaskDB
+from .task_db import TaskDB, ImaginaryFrequencyDB
 from .submit_registry import SubmitTaskScanner
 from .phonon_utils import (
     generate_phonon_displacements,
     postprocess_phonon,
     check_imaginary_frequency,
     postprocess_qha,
+    get_missing_qha_static_energy_volumes,
     generate_bte_displacements,
     postprocess_bte,
 )
@@ -44,6 +45,17 @@ logger.info("所有模块加载完成")
 
 class Manager:
     """任务管理器 - Sbatch模式"""
+
+    @staticmethod
+    def _normalize_volume_list(volumes) -> List[float]:
+        """规范化 QHA 体积列表，确保后续可直接做数值计算。"""
+        normalized = []
+        for raw_volume in volumes:
+            try:
+                normalized.append(float(raw_volume))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid qha.volumes entry: {raw_volume!r}") from exc
+        return normalized
 
     def __init__(self, config: dict = None):
         logger.info("正在初始化 Manager...")
@@ -96,12 +108,16 @@ class Manager:
         self.potcar_functional = potcar_config.get('functional', 'PBE_54')
 
         # 默认体积列表 (用于QHA)
-        self.default_volumes = self.qha_config.get('volumes', [0.98, 0.99, 1.0, 1.01, 1.02])
+        self.default_volumes = self._normalize_volume_list(
+            self.qha_config.get('volumes', [0.98, 0.99, 1.0, 1.01, 1.02])
+        )
 
         # SQLite任务数据库
         logger.info("正在初始化任务数据库...")
         self.db = TaskDB(config, skip_backfill=self.plain_submit)
+        self.imaginary_db = ImaginaryFrequencyDB(config)
         self.submit_scanner = SubmitTaskScanner(self.work_dir, self.structures_dir)
+        self._backfill_workflow_state_from_markers()
 
         # 标记已处理的结构，避免重复
         self._phonon_generated: Set[str] = set()
@@ -110,6 +126,7 @@ class Manager:
         self._qha_postprocessed: Set[str] = set()
         self._bte_generated: Set[str] = set()
         self._bte_postprocessed: Set[str] = set()
+        self._postprocess_failures: Set[str] = set()
 
         logger.info("Manager 初始化完成")
 
@@ -123,16 +140,69 @@ class Manager:
             return 'pending'
         return 'not_ready'
 
-    def _get_active_slurm_jobs(self) -> Optional[Set[str]]:
+    def _iter_submit_task_dirs(self, parent_dir: Path) -> List[Path]:
+        """返回应被注册/提交的任务目录。"""
+        return [task_dir for task_dir in sorted(parent_dir.glob('task.*')) if task_dir.is_dir()]
+
+    def _register_submit_tasks(self, parent_dir: Path, task_type: str) -> List[Path]:
+        """确保目录下所有 task.* 都已注册到数据库。"""
+        task_dirs = []
+        for task_dir in self._iter_submit_task_dirs(parent_dir):
+            if not (task_dir / 'POSCAR').exists():
+                continue
+            task_path = str(task_dir.relative_to(self.work_dir))
+            self.db.add_task(task_path, task_type)
+            task_dirs.append(task_dir)
+        return task_dirs
+
+    def _check_registered_submit_tasks_completed(self, parent_dir: Path, task_type: str) -> bool:
+        """检查目录下所有 task.* 是否已注册且成功。"""
+        task_dirs = self._register_submit_tasks(parent_dir, task_type)
+        if not task_dirs:
+            return False
+
+        for task_dir in task_dirs:
+            task = self._get_db_task(task_dir)
+            if not task or task['status'] != 'success':
+                return False
+        return True
+
+    def _get_active_slurm_jobs(self, job_ids: Optional[Iterable[str]] = None) -> Optional[Set[str]]:
         """获取当前活跃的 SLURM job id；查询失败时返回 None。"""
-        result = subprocess.run(
-            ['squeue', '-u', os.environ.get('USER', 'root'), '-h', '-o', '%i'],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
+        normalized_job_ids = None
+        if job_ids is not None:
+            normalized_job_ids = sorted({str(job_id).strip() for job_id in job_ids if str(job_id).strip()})
+            if not normalized_job_ids:
+                return set()
+
+        command = ['squeue', '-h', '-o', '%i']
+        query_scope = f"用户 {os.environ.get('USER', 'root')} 的作业"
+        if normalized_job_ids is None:
+            command.extend(['-u', os.environ.get('USER', 'root')])
+        else:
+            command.extend(['-j', ','.join(normalized_job_ids)])
+            query_scope = f"{len(normalized_job_ids)} 个运行中任务"
+
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning(f"查询 squeue 超时，跳过 running 状态校正: {query_scope}")
+            return None
+        except Exception as exc:
+            logger.warning(f"查询 squeue 失败，跳过 running 状态校正: {query_scope} ({exc})")
+            return None
+
         if result.returncode != 0:
-            logger.warning("查询 squeue 失败，跳过 running 状态校正")
+            error = result.stderr.strip()
+            if error:
+                logger.warning(f"查询 squeue 失败，跳过 running 状态校正: {query_scope} ({error})")
+            else:
+                logger.warning(f"查询 squeue 失败，跳过 running 状态校正: {query_scope}")
             return None
         return {job_id for job_id in result.stdout.strip().split() if job_id}
 
@@ -157,6 +227,107 @@ class Manager:
     def _postprocess_marker(self, struct_dir: Path, name: str) -> Path:
         """结构根目录下的后处理标记。"""
         return struct_dir / f".postprocess__{name}"
+
+    def _postprocess_failure_key(self, struct_dir: Path, stage: str,
+                                 volume_name: Optional[str] = None) -> str:
+        """当前 manager 进程内用于抑制重复后处理失败重试的 key。"""
+        parts = [struct_dir.name, stage]
+        if volume_name:
+            parts.append(volume_name)
+        return "::".join(parts)
+
+    def _postprocess_error_file(self, struct_dir: Path, stage: str,
+                                volume_name: Optional[str] = None) -> Path:
+        """后处理错误日志文件。"""
+        if volume_name is not None:
+            error_dir = struct_dir / volume_name / 'analyze'
+            error_dir.mkdir(exist_ok=True)
+            return error_dir / 'postprocess_error.log'
+
+        error_dir = struct_dir / 'analyze'
+        error_dir.mkdir(exist_ok=True)
+        return error_dir / f'{stage}_postprocess_error.log'
+
+    def _record_postprocess_error(self, struct_dir: Path, stage: str, exc: Exception,
+                                  volume_name: Optional[str] = None):
+        """写入后处理失败日志，便于定位单个结构问题。"""
+        error_file = self._postprocess_error_file(
+            struct_dir,
+            stage,
+            volume_name=volume_name,
+        )
+        error_file.write_text(
+            f"{datetime.now().isoformat()}\n"
+            f"{type(exc).__name__}: {exc}\n"
+        )
+
+    def _clear_postprocess_error(self, struct_dir: Path, stage: str,
+                                 volume_name: Optional[str] = None):
+        """清理后处理失败日志。"""
+        error_file = self._postprocess_error_file(
+            struct_dir,
+            stage,
+            volume_name=volume_name,
+        )
+        if error_file.exists():
+            error_file.unlink()
+
+    def _workflow_has(self, structure_name: str, stage: str,
+                      volume_name: Optional[str] = None,
+                      pressure_name: Optional[str] = None,
+                      state: Optional[str] = None) -> bool:
+        """查询 workflow_state。"""
+        return self.db.has_workflow_state(
+            structure_name,
+            stage,
+            state=state,
+            volume_name=volume_name,
+            pressure_name=pressure_name,
+        )
+
+    def _workflow_set(self, structure_name: str, stage: str, state: str = 'done',
+                      volume_name: Optional[str] = None,
+                      pressure_name: Optional[str] = None,
+                      source_task: Optional[str] = None):
+        """写入 workflow_state。"""
+        self.db.set_workflow_state(
+            structure_name,
+            stage,
+            state=state,
+            volume_name=volume_name,
+            pressure_name=pressure_name,
+            source_task=source_task,
+        )
+
+    def _workflow_clear(self, structure_name: str,
+                        volume_name: Optional[str] = None,
+                        pressure_name: Optional[str] = None,
+                        stages: Optional[List[str]] = None):
+        """删除 workflow_state。"""
+        self.db.delete_workflow_states(
+            structure_name=structure_name,
+            volume_name=volume_name,
+            pressure_name=pressure_name,
+            stages=stages,
+        )
+
+    def _backfill_workflow_state_from_markers(self):
+        """从已有 marker 文件回填 workflow_state，避免升级后重复后处理。"""
+        if not self.structures_dir.exists():
+            return
+
+        for struct_dir in self.structures_dir.iterdir():
+            if not struct_dir.is_dir():
+                continue
+
+            if (struct_dir / '.phonon_done').exists() or self._postprocess_marker(struct_dir, 'phonon__volume_1.0').exists():
+                self._workflow_set(struct_dir.name, 'phonon_postprocessed', volume_name='volume_1.0')
+
+            if self._postprocess_marker(struct_dir, 'qha').exists():
+                self._workflow_set(struct_dir.name, 'qha_postprocessed')
+
+            if (struct_dir / '.imaginary_frequency').exists() or (struct_dir / '.has_imag').exists():
+                self._workflow_set(struct_dir.name, 'imaginary_checked', state='has_imaginary', volume_name='volume_1.0')
 
     def record_task_time(self, task_path: Path, start_time: str, end_time: str, duration: float, status: str):
         """记录任务执行时间
@@ -221,7 +392,6 @@ class Manager:
             end_time = time_data.get('end_time', '')
             duration = float(time_data.get('duration_seconds', 0))
             task_status = time_data.get('status', task_status)
-
             if start_time and end_time:
                 self.record_task_time(task_dir, start_time, end_time, duration, task_status)
                 self.db.update_task_time(task_rel, start_time, end_time, duration, task_status)
@@ -296,8 +466,8 @@ class Manager:
 
                 # 扫描phonon/qha任务
                 for volume_dir in struct_dir.glob('volume_*'):
-                    for task_dir in volume_dir.glob('task.*'):
-                        if not task_dir.is_dir() or task_dir.name == 'task_perfect':
+                    for task_dir in self._iter_submit_task_dirs(volume_dir):
+                        if not task_dir.is_dir():
                             continue
                         if not (task_dir / 'POSCAR').exists():
                             continue
@@ -343,8 +513,8 @@ class Manager:
                             if not fc_dir.exists():
                                 continue
                             bte_task_type = f'bte_{fc_type}'
-                            for task_dir in fc_dir.glob('task.*'):
-                                if not task_dir.is_dir() or task_dir.name == 'task_perfect':
+                            for task_dir in self._iter_submit_task_dirs(fc_dir):
+                                if not task_dir.is_dir():
                                     continue
                                 if not (task_dir / 'POSCAR').exists():
                                     continue
@@ -440,7 +610,7 @@ class Manager:
         )
 
     def sync_all_submit_tasks(self):
-        """普通 sync：递归扫描 opt/task.*/task_perfect 并同步数据库。"""
+        """普通 sync：递归扫描 opt/task.* 并同步数据库。"""
         return self._sync_submit_candidates(
             False,
             '递归扫描 opt/task.* 目录'
@@ -454,7 +624,7 @@ class Manager:
         )
 
     def register_all_submit_tasks(self):
-        """普通 sync：只注册 opt/task.*/task_perfect。"""
+        """普通 sync：只注册 opt/task.*。"""
         return self._register_submit_candidates(
             False,
             '递归注册 opt/task.* 目录'
@@ -508,12 +678,14 @@ class Manager:
             'pending': 0,
             'removed': 0,
         }
-        active_jobs = self._get_active_slurm_jobs()
+        running_tasks = self.db.get_running_tasks()
+        running_job_ids = [task_data.get('slurm_job_id') for task_data in running_tasks if task_data.get('slurm_job_id')]
+        active_jobs = self._get_active_slurm_jobs(running_job_ids)
         status_updates = []
         pending_paths = []
         stale_job_ids = []
 
-        for task_data in self.db.get_running_tasks():
+        for task_data in running_tasks:
             task_path_str = task_data['path']
             task_dir = self.work_dir / task_path_str
             slurm_job_id = task_data.get('slurm_job_id')
@@ -542,8 +714,7 @@ class Manager:
 
         self.db.reset_tasks_to_pending_bulk(pending_paths)
         self.db.update_status_bulk(status_updates)
-        for job_id in stale_job_ids:
-            self._remove_job_mapping(job_id)
+        self._remove_job_mappings(stale_job_ids)
 
         logger.info(
             "已恢复运行中任务状态: "
@@ -563,7 +734,8 @@ class Manager:
         synced = 0
         reset_to_failed = 0
         reset_to_pending = 0
-        active_jobs = self._get_active_slurm_jobs()
+        running_job_ids = [task_data.get('slurm_job_id') for task_data in running_tasks if task_data.get('slurm_job_id')]
+        active_jobs = self._get_active_slurm_jobs(running_job_ids)
         status_updates = []
         pending_paths = []
         stale_job_ids = []
@@ -598,8 +770,7 @@ class Manager:
 
         self.db.reset_tasks_to_pending_bulk(pending_paths)
         self.db.update_status_bulk(status_updates)
-        for job_id in stale_job_ids:
-            self._remove_job_mapping(job_id)
+        self._remove_job_mappings(stale_job_ids)
 
         if synced > 0:
             logger.info(f"同步了 {synced} 个running任务状态")
@@ -714,6 +885,25 @@ class Manager:
             del jobs[job_id]
             self.jobs_file.write_text(json.dumps(jobs, indent=2))
 
+    def _remove_job_mappings(self, job_ids: List[str]):
+        """批量移除已结束或失效的 job_id 映射。"""
+        if not job_ids or not self.jobs_file.exists():
+            return
+
+        stale_ids = {job_id for job_id in job_ids if job_id}
+        if not stale_ids:
+            return
+
+        jobs = json.loads(self.jobs_file.read_text())
+        changed = False
+        for job_id in stale_ids:
+            if job_id in jobs:
+                del jobs[job_id]
+                changed = True
+
+        if changed:
+            self.jobs_file.write_text(json.dumps(jobs, indent=2))
+
     def submit_pending_tasks(self):
         """从队列获取pending任务并提交（受max_workers限制）"""
         # 读取最大并发任务数，默认为1
@@ -801,6 +991,46 @@ class Manager:
             return []
         return [d for d in self.structures_dir.iterdir() if d.is_dir()]
 
+    def _build_qha_scan_state(self) -> Dict[str, Set]:
+        """批量加载 QHA 工作流常用状态，避免按结构反复查库。"""
+        opt_success = {
+            task['structure_name']
+            for task in self.db.get_tasks(task_type='opt', status='success')
+            if task.get('structure_name')
+        }
+
+        phonon_registered = {
+            (row['structure_name'], row['volume_name'])
+            for row in self.db.get_workflow_states(stage='phonon_generated')
+            if row.get('structure_name')
+        }
+
+        qha_opt_registered = {
+            (row['structure_name'], row['volume_name'])
+            for row in self.db.get_workflow_states(stage='qha_opt_generated')
+            if row.get('structure_name')
+        }
+
+        qha_opt_success = {
+            (task['structure_name'], task['volume_name'])
+            for task in self.db.get_tasks(task_type='qha_opt', status='success')
+            if task.get('structure_name') and task.get('volume_name')
+        }
+
+        qha_registered = {
+            (row['structure_name'], row['volume_name'])
+            for row in self.db.get_workflow_states(stage='qha_generated')
+            if row.get('structure_name')
+        }
+
+        return {
+            'opt_success': opt_success,
+            'phonon_registered': phonon_registered,
+            'qha_opt_registered': qha_opt_registered,
+            'qha_opt_success': qha_opt_success,
+            'qha_registered': qha_registered,
+        }
+
     def _refine_structure(self, poscar_path: Path) -> None:
         """使用pymatgen标准化结构（保持primitive cell）"""
         try:
@@ -813,11 +1043,14 @@ class Manager:
         except Exception as e:
             logger.warning(f"    结构标准化失败 {poscar_path}: {e}")
 
-    def generate_opt_tasks(self):
+    def generate_opt_tasks(self, struct_dirs: Optional[List[Path]] = None):
         """生成结构优化任务"""
         logger.info("=== 扫描结构优化任务 ===")
 
-        for struct_dir in self.get_all_structures():
+        if struct_dirs is None:
+            struct_dirs = self.get_all_structures()
+
+        for struct_dir in struct_dirs:
             opt_dir = struct_dir / 'opt'
 
             # 如果opt目录不存在但结构目录下有POSCAR，自动创建opt任务
@@ -832,6 +1065,7 @@ class Manager:
                     # 添加到任务队列（VASP输入文件在提交时实时生成）
                     task_path = str(opt_dir.relative_to(self.work_dir))
                     self.db.add_task(task_path, 'opt')
+                    self._workflow_set(struct_dir.name, 'opt_generated', source_task=task_path)
 
     def check_opt_completed(self, struct_dir: Path) -> bool:
         """检查结构优化是否完成"""
@@ -852,35 +1086,43 @@ class Manager:
             return read(str(poscar))
         return None
 
-    def generate_phonon_tasks(self):
+    def generate_phonon_tasks(self, struct_dirs: Optional[List[Path]] = None,
+                              scan_state: Optional[Dict[str, Set]] = None):
         """生成声子计算任务"""
         logger.info("=== 生成声子计算任务 ===")
 
-        for struct_dir in self.get_all_structures():
-            volume_dir = struct_dir / 'volume_1.0'
-            marker = self._generation_marker(struct_dir, 'phonon__volume_1.0')
-            if marker.exists():
-                if self._get_tasks_under(volume_dir, task_type='phonon'):
-                    continue
-                marker.unlink()
+        if struct_dirs is None:
+            struct_dirs = self.get_all_structures()
+        if scan_state is None:
+            scan_state = self._build_qha_scan_state()
 
-            if not self.check_opt_completed(struct_dir):
+        opt_success = scan_state['opt_success']
+        phonon_registered = scan_state['phonon_registered']
+
+        for struct_dir in struct_dirs:
+            volume_dir = struct_dir / 'volume_1.0'
+            volume_key = (struct_dir.name, volume_dir.name)
+            if volume_key in phonon_registered and not volume_dir.exists():
+                self._workflow_clear(struct_dir.name, volume_name=volume_dir.name, stages=['phonon_generated'])
+                phonon_registered.discard(volume_key)
+
+            if struct_dir.name not in opt_success:
+                continue
+
+            if volume_key in phonon_registered:
                 continue
 
             if not volume_dir.exists():
                 self._prepare_phonon_tasks(struct_dir, volume_dir)
+                phonon_registered.add(volume_key)
+                continue
 
             if volume_dir.exists():
-                task_dirs = [d for d in volume_dir.iterdir()
-                            if d.is_dir() and d.name.startswith('task.') and d.name != 'task_perfect']
-
-                # 确保已存在的任务都注册到数据库
-                for task_dir in task_dirs:
-                    task_path = str(task_dir.relative_to(self.work_dir))
-                    self.db.add_task(task_path, 'phonon')
+                task_dirs = self._register_submit_tasks(volume_dir, 'phonon')
 
                 if task_dirs:
-                    marker.touch()
+                    phonon_registered.add(volume_key)
+                    self._workflow_set(struct_dir.name, 'phonon_generated', volume_name=volume_dir.name)
 
     def _prepare_phonon_tasks(self, struct_dir: Path, volume_dir: Path):
         """准备声子计算任务"""
@@ -912,11 +1154,10 @@ class Manager:
         )
         logger.info(f"    生成 {n_tasks} 个位移任务")
 
-        # 添加phonon任务到队列
-        for i in range(n_tasks):
-            task_dir = volume_dir / f'task.{i:06d}'
-            task_path = str(task_dir.relative_to(self.work_dir))
-            self.db.add_task(task_path, 'phonon')
+        # 添加phonon任务到队列，包含 task.perfect
+        self._register_submit_tasks(volume_dir, 'phonon')
+
+        self._workflow_set(struct_dir.name, 'phonon_generated', volume_name=volume_dir.name)
 
         # 声子位移任务的VASP输入文件在提交时实时生成
 
@@ -1051,35 +1292,66 @@ class Manager:
         volume_dir = struct_dir / 'volume_1.0'
         if not volume_dir.exists():
             return False
-
-        tasks = self._get_tasks_under(volume_dir, task_type='phonon')
-        if not tasks:
-            return False
-
-        return all(task['status'] == 'success' for task in tasks)
+        return self._check_registered_submit_tasks_completed(volume_dir, 'phonon')
 
     def check_imaginary_frequency_wrapper(self, struct_dir: Path) -> bool:
         """检查是否存在虚频"""
+        if (struct_dir / '.imaginary_frequency').exists():
+            return True
+        if self._workflow_has(struct_dir.name, 'imaginary_checked', state='has_imaginary', volume_name='volume_1.0'):
+            return True
+        if self._workflow_has(struct_dir.name, 'imaginary_checked', state='clear', volume_name='volume_1.0'):
+            return False
+
         volume_dir = struct_dir / 'volume_1.0'
         if not volume_dir.exists():
             return False
 
-        return check_imaginary_frequency(str(volume_dir))
+        cached = self.imaginary_db.get_cached_result(volume_dir)
+        if cached is not None:
+            self._workflow_set(
+                struct_dir.name,
+                'imaginary_checked',
+                state='has_imaginary' if cached else 'clear',
+                volume_name=volume_dir.name,
+            )
+            return cached
 
-    def generate_qha_tasks(self):
+        has_imaginary = check_imaginary_frequency(str(volume_dir))
+        self.imaginary_db.set_cached_result(volume_dir, has_imaginary)
+        self._workflow_set(
+            struct_dir.name,
+            'imaginary_checked',
+            state='has_imaginary' if has_imaginary else 'clear',
+            volume_name=volume_dir.name,
+        )
+        return has_imaginary
+
+    def generate_qha_tasks(self, struct_dirs: Optional[List[Path]] = None,
+                           scan_state: Optional[Dict[str, Set]] = None):
         """生成QHA任务"""
         logger.info("=== 生成QHA计算任务 ===")
 
-        for struct_dir in self.get_all_structures():
-            qha_opt_markers = [
-                self._generation_marker(struct_dir, f'qha_opt__volume_{vol}')
+        if struct_dirs is None:
+            struct_dirs = self.get_all_structures()
+        if scan_state is None:
+            scan_state = self._build_qha_scan_state()
+
+        qha_opt_registered = scan_state['qha_opt_registered']
+
+        for struct_dir in struct_dirs:
+            qha_opt_targets = [
+                (struct_dir.name, f'volume_{vol}')
                 for vol in self.default_volumes if vol != 1.0
             ]
-            if qha_opt_markers and all(marker.exists() for marker in qha_opt_markers):
+            if qha_opt_targets and all(target in qha_opt_registered for target in qha_opt_targets):
                 continue
 
             volume_1_analyze = struct_dir / 'volume_1.0' / 'analyze' / 'phonopy_params.yaml'
             if not volume_1_analyze.exists():
+                continue
+
+            if (struct_dir / '.imaginary_frequency').exists():
                 continue
 
             if self.check_imaginary_frequency_wrapper(struct_dir):
@@ -1088,32 +1360,42 @@ class Manager:
                 imaginary_flag.touch()
                 continue
 
-            self._prepare_qha_volumes(struct_dir)
+            self._prepare_qha_volumes(struct_dir, qha_opt_registered)
 
-    def _prepare_qha_volumes(self, struct_dir: Path):
+    def _prepare_qha_volumes(self, struct_dir: Path,
+                             qha_opt_registered: Optional[Set[Tuple[str, str]]] = None):
         """准备QHA所需的各体积点 - 第一步：创建优化任务"""
         atoms = self._get_optimized_structure(struct_dir)
         if atoms is None:
             return
+
+        if qha_opt_registered is None:
+            qha_opt_registered = {
+                (task['structure_name'], task['volume_name'])
+                for task in self.db.get_tasks(task_type='qha_opt')
+                if task.get('structure_name') and task.get('volume_name')
+            }
 
         for vol in self.default_volumes:
             if vol == 1.0:
                 continue
 
             volume_dir = struct_dir / f'volume_{vol}'
+            volume_key = (struct_dir.name, volume_dir.name)
             opt_dir = volume_dir / 'opt'
-            marker = self._generation_marker(struct_dir, f'qha_opt__volume_{vol}')
-            if marker.exists():
-                if opt_dir.exists() or self._get_db_task(opt_dir):
-                    continue
-                marker.unlink()
+            if volume_key in qha_opt_registered and not opt_dir.exists():
+                self._workflow_clear(struct_dir.name, volume_name=volume_dir.name, stages=['qha_opt_generated'])
+                qha_opt_registered.discard(volume_key)
+            elif volume_key in qha_opt_registered:
+                continue
 
             # 如果优化目录已存在，跳过
             if opt_dir.exists():
                 # 确保优化任务已注册到数据库
                 task_path = str(opt_dir.relative_to(self.work_dir))
                 self.db.add_task(task_path, 'qha_opt')
-                marker.touch()
+                qha_opt_registered.add(volume_key)
+                self._workflow_set(struct_dir.name, 'qha_opt_generated', volume_name=volume_dir.name, source_task=task_path)
                 continue
 
             logger.info(f"  创建体积 {vol} 的优化任务: {struct_dir.name}")
@@ -1135,25 +1417,34 @@ class Manager:
             # 添加优化任务到数据库
             task_path = str(opt_dir.relative_to(self.work_dir))
             self.db.add_task(task_path, 'qha_opt')
-            marker.touch()
+            qha_opt_registered.add(volume_key)
+            self._workflow_set(struct_dir.name, 'qha_opt_generated', volume_name=volume_dir.name, source_task=task_path)
             logger.info(f"    已创建优化任务: {task_path}")
 
-    def generate_qha_phonon_tasks(self):
+    def generate_qha_phonon_tasks(self, struct_dirs: Optional[List[Path]] = None,
+                                  scan_state: Optional[Dict[str, Set]] = None):
         """生成QHA声子任务 - 在优化完成后"""
         logger.info("=== 检查QHA优化并生成声子任务 ===")
 
-        for struct_dir in self.get_all_structures():
+        if struct_dirs is None:
+            struct_dirs = self.get_all_structures()
+        if scan_state is None:
+            scan_state = self._build_qha_scan_state()
+
+        qha_opt_success = scan_state['qha_opt_success']
+        qha_registered = scan_state['qha_registered']
+
+        for struct_dir in struct_dirs:
             # 检查每个体积点的优化是否完成
             for vol in self.default_volumes:
                 if vol == 1.0:
                     continue
 
                 volume_dir = struct_dir / f'volume_{vol}'
-                marker = self._generation_marker(struct_dir, f'qha__volume_{vol}')
-                if marker.exists():
-                    if self._get_tasks_under(volume_dir, task_type='qha'):
-                        continue
-                    marker.unlink()
+                volume_key = (struct_dir.name, volume_dir.name)
+                if volume_key in qha_registered and not volume_dir.exists():
+                    self._workflow_clear(struct_dir.name, volume_name=volume_dir.name, stages=['qha_generated'])
+                    qha_registered.discard(volume_key)
 
                 opt_dir = volume_dir / 'opt'
 
@@ -1162,19 +1453,17 @@ class Manager:
                     continue
 
                 # 检查优化是否完成
-                opt_task = self._get_db_task(opt_dir)
-                if not opt_task or opt_task['status'] != 'success':
+                if volume_key not in qha_opt_success:
+                    continue
+
+                if volume_key in qha_registered:
                     continue
 
                 # 检查声子任务是否已生成
-                task_dirs = list(volume_dir.glob('task.*'))
-                if any(d.name != 'task_perfect' for d in task_dirs if d.is_dir()):
-                    # 声子任务已存在，确保都注册到数据库
-                    for task_dir in task_dirs:
-                        if task_dir.is_dir() and task_dir.name != 'task_perfect':
-                            task_path = str(task_dir.relative_to(self.work_dir))
-                            self.db.add_task(task_path, 'qha')
-                    marker.touch()
+                task_dirs = self._register_submit_tasks(volume_dir, 'qha')
+                if task_dirs:
+                    qha_registered.add(volume_key)
+                    self._workflow_set(struct_dir.name, 'qha_generated', volume_name=volume_dir.name)
                     continue
 
                 # 优化完成但声子任务未生成，现在生成
@@ -1205,12 +1494,10 @@ class Manager:
                 )
                 logger.info(f"    生成 {n_tasks} 个位移任务")
 
-                # 添加qha任务到队列
-                for i in range(n_tasks):
-                    task_dir = volume_dir / f'task.{i:06d}'
-                    task_path = str(task_dir.relative_to(self.work_dir))
-                    self.db.add_task(task_path, 'qha')
-                marker.touch()
+                # 添加qha任务到队列，包含 task.perfect
+                self._register_submit_tasks(volume_dir, 'qha')
+                qha_registered.add(volume_key)
+                self._workflow_set(struct_dir.name, 'qha_generated', volume_name=volume_dir.name)
 
                 # VASP输入文件在提交时实时生成
 
@@ -1238,26 +1525,81 @@ class Manager:
 
         for struct_dir in self.get_all_structures():
             # 声子后处理
-            phonon_marker = self._postprocess_marker(struct_dir, 'phonon__volume_1.0')
-            if not phonon_marker.exists():
+            if not self._workflow_has(struct_dir.name, 'phonon_postprocessed', volume_name='volume_1.0'):
                 if self.check_phonon_completed(struct_dir):
                     volume_dir = struct_dir / 'volume_1.0'
                     analyze_file = volume_dir / 'analyze' / 'phonopy_params.yaml'
-                    if not analyze_file.exists():
+                    failure_key = self._postprocess_failure_key(
+                        struct_dir, 'phonon', volume_name=volume_dir.name
+                    )
+                    if not analyze_file.exists() and failure_key not in self._postprocess_failures:
                         logger.info(f"[POSTPROCESS] {struct_dir.name} 开始声子后处理...")
-                        self._postprocess_phonon(struct_dir)
+                        try:
+                            self._postprocess_phonon(struct_dir)
+                            self._postprocess_failures.discard(failure_key)
+                            self._clear_postprocess_error(
+                                struct_dir, 'phonon', volume_name=volume_dir.name
+                            )
+                        except Exception as exc:
+                            self._postprocess_failures.add(failure_key)
+                            self._record_postprocess_error(
+                                struct_dir, 'phonon', exc, volume_name=volume_dir.name
+                            )
+                            logger.exception(f"  声子后处理失败: {struct_dir.name}")
 
             # QHA后处理
-            qha_marker = self._postprocess_marker(struct_dir, 'qha')
-            if not qha_marker.exists():
+            if not self._workflow_has(struct_dir.name, 'qha_postprocessed'):
                 if self._check_all_qha_phonons_completed(struct_dir):
+                    volume_postprocess_failed = False
                     for vol in self.default_volumes:
                         volume_dir = struct_dir / f'volume_{vol}'
                         analyze_file = volume_dir / 'analyze' / 'phonopy_params.yaml'
-                        if volume_dir.exists() and not analyze_file.exists():
-                            self._postprocess_phonon_volume(struct_dir, volume_dir)
+                        failure_key = self._postprocess_failure_key(
+                            struct_dir, 'phonon', volume_name=volume_dir.name
+                        )
+                        if volume_dir.exists() and not analyze_file.exists() and failure_key not in self._postprocess_failures:
+                            try:
+                                self._postprocess_phonon_volume(struct_dir, volume_dir)
+                                self._postprocess_failures.discard(failure_key)
+                                self._clear_postprocess_error(
+                                    struct_dir, 'phonon', volume_name=volume_dir.name
+                                )
+                            except Exception as exc:
+                                volume_postprocess_failed = True
+                                self._postprocess_failures.add(failure_key)
+                                self._record_postprocess_error(
+                                    struct_dir, 'phonon', exc, volume_name=volume_dir.name
+                                )
+                                logger.exception(
+                                    f"  QHA体积点声子后处理失败: {struct_dir.name}/{volume_dir.name}"
+                                )
 
-                    self._postprocess_qha(struct_dir)
+                    if volume_postprocess_failed:
+                        continue
+
+                    static_ready, missing_volumes = self._qha_static_energies_ready(struct_dir)
+                    if not static_ready:
+                        missing_summary = ', '.join(missing_volumes[:5])
+                        if len(missing_volumes) > 5:
+                            missing_summary += ', ...'
+                        logger.info(
+                            f"  跳过QHA后处理: {struct_dir.name} 静态能未齐 "
+                            f"({len(missing_volumes)}/{len(self.default_volumes)} 缺失: {missing_summary})"
+                        )
+                        continue
+
+                    qha_failure_key = self._postprocess_failure_key(struct_dir, 'qha')
+                    if qha_failure_key in self._postprocess_failures:
+                        continue
+
+                    try:
+                        self._postprocess_qha(struct_dir)
+                        self._postprocess_failures.discard(qha_failure_key)
+                        self._clear_postprocess_error(struct_dir, 'qha')
+                    except Exception as exc:
+                        self._postprocess_failures.add(qha_failure_key)
+                        self._record_postprocess_error(struct_dir, 'qha', exc)
+                        logger.exception(f"  QHA后处理失败: {struct_dir.name}")
 
     def _check_all_qha_phonons_completed(self, struct_dir: Path) -> bool:
         """检查所有QHA体积点的声子计算是否完成"""
@@ -1267,11 +1609,7 @@ class Manager:
                 return False
 
             task_type = 'phonon' if vol == 1.0 else 'qha'
-            tasks = self._get_tasks_under(volume_dir, task_type=task_type)
-            if not tasks:
-                return False
-
-            if not all(task['status'] == 'success' for task in tasks):
+            if not self._check_registered_submit_tasks_completed(volume_dir, task_type):
                 return False
 
         return True
@@ -1283,6 +1621,7 @@ class Manager:
         # 创建phonon完成标记
         (struct_dir / '.phonon_done').touch()
         self._postprocess_marker(struct_dir, 'phonon__volume_1.0').touch()
+        self._workflow_set(struct_dir.name, 'phonon_postprocessed', volume_name=volume_dir.name)
         logger.info(f"  声子后处理完成: {struct_dir.name}")
 
     def _postprocess_phonon_volume(self, struct_dir: Path, volume_dir: Path):
@@ -1302,11 +1641,20 @@ class Manager:
             t_step=t_step,
             use_vasprun=use_vasprun
         )
+        self.imaginary_db.set_cached_result(volume_dir, has_imaginary)
 
         if has_imaginary:
             logger.warning(f"    存在虚频")
             # 创建虚频标记文件（在结构文件夹下）
             (volume_dir.parent / '.has_imag').touch()
+            self._workflow_set(struct_dir.name, 'imaginary_checked', state='has_imaginary', volume_name=volume_dir.name)
+        elif volume_dir.name == 'volume_1.0':
+            imaginary_flag = volume_dir.parent / '.imaginary_frequency'
+            if imaginary_flag.exists():
+                imaginary_flag.unlink()
+            self._workflow_set(struct_dir.name, 'imaginary_checked', state='clear', volume_name=volume_dir.name)
+        else:
+            self._workflow_set(struct_dir.name, 'imaginary_checked', state='clear', volume_name=volume_dir.name)
 
     def _postprocess_qha(self, struct_dir: Path):
         """QHA后处理"""
@@ -1329,6 +1677,17 @@ class Manager:
             use_vasprun=use_vasprun
         )
         self._postprocess_marker(struct_dir, 'qha').touch()
+        self._workflow_set(struct_dir.name, 'qha_postprocessed')
+
+    def _qha_static_energies_ready(self, struct_dir: Path) -> Tuple[bool, List[str]]:
+        """检查 QHA 所需静态能是否齐全。"""
+        use_vasprun = (self.worker_mode == 'vasp')
+        missing_volumes = get_missing_qha_static_energy_volumes(
+            str(struct_dir),
+            self.default_volumes,
+            use_vasprun=use_vasprun,
+        )
+        return len(missing_volumes) == 0, missing_volumes
 
     # ========== BTE 工作流 ==========
     # 流程: opt(0GPa) → P_XXGPa/opt(带PSTRESS) → fc2 → 虚频检查 → fc3 → BTE后处理
@@ -1412,10 +1771,7 @@ class Manager:
 
                 if bte_dir.exists():
                     if fc2_dir.exists():
-                        for task_dir in fc2_dir.glob('task.*'):
-                            if task_dir.is_dir() and task_dir.name != 'task_perfect':
-                                task_path = str(task_dir.relative_to(self.work_dir))
-                                self.db.add_task(task_path, 'bte_fc2')
+                        self._register_submit_tasks(fc2_dir, 'bte_fc2')
 
                     fc2_marker.touch()
                     self._bte_generated.add(cache_key)
@@ -1464,13 +1820,8 @@ class Manager:
                 (bte_dir / '.fc2_checked').touch()
 
                 if fc3_dir.exists():
-                    n_registered = 0
-                    for task_dir in fc3_dir.glob('task.*'):
-                        if task_dir.is_dir() and task_dir.name != 'task_perfect':
-                            task_path = str(task_dir.relative_to(self.work_dir))
-                            if self.db.add_task(task_path, 'bte_fc3'):
-                                n_registered += 1
-                    logger.info(f"    注册 {n_registered} 个fc3任务")
+                    task_dirs = self._register_submit_tasks(fc3_dir, 'bte_fc3')
+                    logger.info(f"    注册 {len(task_dirs)} 个fc3任务")
                     fc3_marker.touch()
 
     def _prepare_bte_displacements_at_pressure(self, struct_dir: Path, p_dir: Path):
@@ -1548,10 +1899,7 @@ class Manager:
         if not fc_dir.exists():
             return False
         task_type = 'bte_fc2' if fc_dir.name == 'fc2' else 'bte_fc3'
-        tasks = self._get_tasks_under(fc_dir, task_type=task_type)
-        if not tasks:
-            return False
-        return all(task['status'] == 'success' for task in tasks)
+        return self._check_registered_submit_tasks_completed(fc_dir, task_type)
 
     def run_bte_postprocess(self):
         """BTE 后处理（每个压强点独立）"""
@@ -1626,6 +1974,28 @@ class Manager:
                   f"success={success}, failed={failed}")
         logger.info("-------------------\n")
 
+    def prepare_tasks_once(self):
+        """按当前配置执行一次任务目录准备，不提交任务。"""
+        if self.plain_submit:
+            self.sync_plain_submit_tasks()
+            return self.collect_statistics()
+
+        struct_dirs = self.get_all_structures()
+        self.generate_opt_tasks(struct_dirs)
+
+        if self.enable_qha:
+            qha_scan_state = self._build_qha_scan_state()
+            self.generate_phonon_tasks(struct_dirs, qha_scan_state)
+            self.generate_qha_tasks(struct_dirs, qha_scan_state)
+            self.generate_qha_phonon_tasks(struct_dirs, qha_scan_state)
+
+        if self.enable_bte:
+            self.generate_bte_pressure_opt_tasks()
+            self.generate_bte_tasks()
+            self.generate_bte_fc3_tasks()
+
+        return self.collect_statistics()
+
     # ========== 主循环 ==========
 
     def run(self):
@@ -1651,18 +2021,7 @@ class Manager:
             self.sync_task_times()
 
             # 3. 任务准备
-            if not self.plain_submit:
-                self.generate_opt_tasks()
-
-                if self.enable_qha:
-                    self.generate_phonon_tasks()
-                    self.generate_qha_tasks()
-                    self.generate_qha_phonon_tasks()
-
-                if self.enable_bte:
-                    self.generate_bte_pressure_opt_tasks()
-                    self.generate_bte_tasks()
-                    self.generate_bte_fc3_tasks()
+            self.prepare_tasks_once()
 
             # 4. 扫描并提交pending任务
             self.submit_pending_tasks()

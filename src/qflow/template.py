@@ -252,6 +252,30 @@ elif [ $EXIT_CODE -ne 0 ]; then
     rm -f .success
     exit 1
 else
+    if [ -f vasprun.xml ]; then
+        python - <<'PY'
+import sys
+try:
+    from pymatgen.io.vasp import Vasprun
+    vasprun = Vasprun("vasprun.xml", parse_dos=False, parse_eigen=False)
+except Exception as exc:
+    print(f"Failed to parse vasprun.xml: {{exc}}", file=sys.stderr)
+    sys.exit(2)
+
+if not vasprun.converged_electronic:
+    print("VASP electronic convergence not reached", file=sys.stderr)
+    sys.exit(3)
+PY
+        CHECK_CODE=$?
+        if [ $CHECK_CODE -ne 0 ]; then
+            echo "ERROR: VASP result validation failed"
+            echo "VASP result validation failed with exit code $CHECK_CODE at $(date)" > error.log
+            echo "status: failed" >> .task_time
+            rm -f .success
+            exit 1
+        fi
+    fi
+
     echo "SUCCESS: VASP completed successfully"
     echo "status: success" >> .task_time
     rm -f .failed .running

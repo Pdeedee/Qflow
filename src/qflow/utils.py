@@ -1,11 +1,79 @@
 """工具函数模块"""
 
+import logging
 import os
 import re
 import yaml
 from pathlib import Path
 from datetime import datetime
 from typing import Iterable, Union
+
+
+INCAR_KEY_ALIASES = {
+    'KSPCAING': 'KSPACING',
+}
+
+
+def _normalize_incar_settings(settings: dict, section_name: str) -> dict:
+    """规范化 INCAR 参数名，修正常见拼写错误并统一大写。"""
+    normalized = {}
+    logger = logging.getLogger('qflow')
+
+    for raw_key, value in settings.items():
+        key = str(raw_key).strip()
+        upper_key = key.upper()
+        normalized_key = INCAR_KEY_ALIASES.get(upper_key, upper_key)
+
+        if normalized_key != upper_key:
+            logger.warning(
+                "检测到 INCAR 参数拼写错误: %s.%s，已自动更正为 %s",
+                section_name,
+                key,
+                normalized_key,
+            )
+
+        if normalized_key in normalized and normalized[normalized_key] != value:
+            logger.warning(
+                "检测到重复 INCAR 参数: %s.%s，已使用后面的值 %r 覆盖前值 %r",
+                section_name,
+                normalized_key,
+                value,
+                normalized[normalized_key],
+            )
+
+        normalized[normalized_key] = value
+
+    return normalized
+
+
+def _normalize_incar_config(config: dict) -> dict:
+    """规范化配置中的 INCAR 段。"""
+    incar_config = config.get('incar')
+    if not isinstance(incar_config, dict):
+        return config
+
+    normalized_config = dict(config)
+    normalized_incar = {}
+    section_keys = {'opt', 'phonon', 'plain', 'qha_opt'}
+    has_sections = any(
+        key in section_keys and isinstance(value, dict)
+        for key, value in incar_config.items()
+    )
+
+    if has_sections:
+        for section, settings in incar_config.items():
+            if isinstance(settings, dict):
+                normalized_incar[section] = _normalize_incar_settings(
+                    settings,
+                    section_name=f"incar.{section}",
+                )
+            else:
+                normalized_incar[section] = settings
+    else:
+        normalized_incar = _normalize_incar_settings(incar_config, section_name='incar')
+
+    normalized_config['incar'] = normalized_incar
+    return normalized_config
 
 
 def get_status_files(config: dict) -> dict:
@@ -32,7 +100,8 @@ def load_config(config_path: str = None) -> dict:
     if config_path is None:
         config_path = os.environ.get('QFLOW_CONFIG', 'config.yaml')
     with open(config_path, 'r', encoding='utf-8') as f:
-        return yaml.safe_load(f)
+        config = yaml.safe_load(f) or {}
+    return _normalize_incar_config(config)
 
 
 def get_task_status(task_path: str, config: dict) -> str:
@@ -118,7 +187,7 @@ def get_task_type(task_path: str) -> str:
     """
     path = Path(task_path)
     path_str = str(path)
-    is_task_dir = path.name.startswith('task.') or path.name == 'task_perfect'
+    is_task_dir = path.name.startswith('task.')
 
     # BTE 任务
     if '/bte/fc2/' in path_str and is_task_dir:
@@ -155,7 +224,7 @@ def get_task_type(task_path: str) -> str:
 def is_submit_candidate_dir(path: Union[str, Path]) -> bool:
     """判断目录是否是可直接提交/跟踪的任务目录。"""
     name = Path(path).name
-    return name == 'opt' or name == 'task_perfect' or name.startswith('task.')
+    return name == 'opt' or name.startswith('task.')
 
 
 def is_plain_submit_candidate_dir(path: Union[str, Path]) -> bool:

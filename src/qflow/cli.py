@@ -640,11 +640,12 @@ def cmd_cancel(args):
 
 
 def cmd_reset(args):
-    """重置任务状态 - 基于数据库定位任务并清理对应标记文件"""
+    """重置任务状态 - 清理任务标记并同步数据库"""
     from .task_db import TaskDB
 
     config = load_config()
     work_dir = Path(config.get('work_dir', '.')).resolve()
+    structures_dir = (work_dir / config['manager']['structures_dir']).resolve()
 
     # 检查是否有manager在运行
     running, info = _is_manager_running(config)
@@ -657,6 +658,21 @@ def cmd_reset(args):
             return
 
     db = TaskDB(config, skip_backfill=True)
+
+    def iter_success_markers(root_dir: Path):
+        """快速递归扫描 .success 标记文件。"""
+        if not root_dir.exists():
+            return
+
+        scan_stack = [root_dir]
+        while scan_stack:
+            current_dir = scan_stack.pop()
+            for entry in os.scandir(current_dir):
+                if entry.is_dir(follow_symlinks=False):
+                    scan_stack.append(Path(entry.path))
+                    continue
+                if entry.name == '.success':
+                    yield Path(entry.path)
 
     if args.running:
         count = 0
@@ -700,13 +716,16 @@ def cmd_reset(args):
         count = 0
         stale_job_ids = []
         for task_data in db.get_tasks(status='success'):
-            task_dir = work_dir / task_data['path']
-            if not task_dir.exists():
-                continue
-            removed = clear_task_status(task_dir, config, statuses=['success'])
-            if removed > 0:
-                count += 1
             stale_job_ids.append(task_data.get('slurm_job_id'))
+
+        if structures_dir.exists():
+            for success_marker in iter_success_markers(structures_dir):
+                task_dir = success_marker.parent
+                if not (task_dir / 'POSCAR').exists():
+                    continue
+                removed = clear_task_status(task_dir, config, statuses=['success'])
+                if removed > 0:
+                    count += 1
 
         db_count = db.reset_success_tasks()
         _remove_job_mappings(work_dir, stale_job_ids)
@@ -725,7 +744,7 @@ def cmd_regen(args):
     import subprocess
     import shutil
     from tqdm import tqdm
-    from .task_db import TaskDB
+    from .task_db import TaskDB, ImaginaryFrequencyDB
     from pymatgen.io.vasp.sets import MPRelaxSet, MatPESStaticSet
     from pymatgen.core import Structure as PMGStructure
 
@@ -740,6 +759,7 @@ def cmd_regen(args):
         return
 
     db = TaskDB(config)
+    imaginary_db = ImaginaryFrequencyDB(config)
 
     # 获取INCAR设置
     incar_config = config.get('incar', {})
@@ -756,6 +776,46 @@ def cmd_regen(args):
     regen_count = 0
     reset_count = 0
     cascade_deleted = 0
+
+    def clear_path(path: Path):
+        if path.exists():
+            path.unlink()
+
+    def clear_workflow_state(struct_dir: Path, stages, volume_name: str = None):
+        db.delete_workflow_states(
+            structure_name=struct_dir.name,
+            volume_name=volume_name,
+            stages=stages,
+        )
+
+    def clear_phonon_postprocess_state(struct_dir: Path, volume_dir: Path):
+        analyze_dir = volume_dir / 'analyze'
+        clear_path(analyze_dir / 'phonopy_params.yaml')
+        clear_path(analyze_dir / 'thermo_properties.yaml')
+        clear_path(analyze_dir / 'imaginary_check.json')
+        clear_path(analyze_dir / 'phonon_band.png')
+        clear_path(analyze_dir / 'phonon_dos.png')
+
+        imaginary_db.invalidate(volume_dir)
+        clear_path(struct_dir / '.phonon_done')
+        clear_path(struct_dir / '.imaginary_frequency')
+        clear_path(struct_dir / '.has_imag')
+        clear_path(struct_dir / '.postprocess__phonon__volume_1.0')
+        clear_path(struct_dir / '.postprocess__qha')
+        clear_workflow_state(
+            struct_dir,
+            ['phonon_postprocessed', 'qha_postprocessed', 'imaginary_checked'],
+        )
+        clear_workflow_state(
+            struct_dir,
+            ['phonon_postprocessed', 'imaginary_checked'],
+            volume_name=volume_dir.name,
+        )
+
+        for marker in struct_dir.glob('.generated__qha_opt__volume_*'):
+            marker.unlink()
+        for marker in struct_dir.glob('.generated__qha__volume_*'):
+            marker.unlink()
 
     if not structures_dir.exists():
         print(f"错误: 结构目录不存在 {structures_dir}")
@@ -792,18 +852,24 @@ def cmd_regen(args):
 
                         # 级联删除: 删除所有volume_*目录
                         for volume_dir in struct_dir.glob('volume_*'):
+                            imaginary_db.invalidate(volume_dir)
+                            clear_workflow_state(
+                                struct_dir,
+                                ['phonon_generated', 'qha_opt_generated', 'qha_generated',
+                                 'phonon_postprocessed', 'imaginary_checked'],
+                                volume_name=volume_dir.name,
+                            )
                             # 删除数据库中的任务
                             for task_dir in volume_dir.glob('task.*'):
-                                if task_dir.is_dir() and task_dir.name != 'task_perfect':
+                                if task_dir.is_dir():
                                     task_path = str(task_dir.relative_to(work_dir))
                                     db.remove_task(task_path)
                                     cascade_deleted += 1
                             # 删除目录
                             shutil.rmtree(volume_dir)
-                        # 清理.has_imag标记
-                        has_imag = struct_dir / '.has_imag'
-                        if has_imag.exists():
-                            has_imag.unlink()
+                        clear_workflow_state(struct_dir, ['qha_postprocessed'])
+                        clear_path(struct_dir / '.imaginary_frequency')
+                        clear_path(struct_dir / '.has_imag')
 
                     except Exception as e:
                         print(f"  警告: {opt_dir} - {e}")
@@ -868,17 +934,15 @@ def cmd_regen(args):
                             db.add_task(task_path, 'phonon')
                             reset_count += 1
 
-                    # 清理.phonon_done标记（需要重新后处理）
-                    phonon_done = struct_dir / '.phonon_done'
-                    if phonon_done.exists():
-                        phonon_done.unlink()
+                    clear_workflow_state(struct_dir, ['phonon_generated'], volume_name=volume_dir.name)
+                    clear_phonon_postprocess_state(struct_dir, volume_dir)
 
                 except Exception as e:
                     print(f"  警告: 创建phonon任务失败 {struct_dir.name} - {e}")
             else:
                 # volume_1.0存在，重新生成已有任务的输入文件
                 for task_dir in volume_dir.glob('task.*'):
-                    if task_dir.is_dir() and task_dir.name != 'task_perfect':
+                    if task_dir.is_dir():
                         poscar = task_dir / 'POSCAR'
                         if poscar.exists():
                             try:
@@ -901,27 +965,29 @@ def cmd_regen(args):
                             except Exception as e:
                                 print(f"  警告: {task_dir} - {e}")
 
-                # 清理.phonon_done标记（需要重新后处理）
-                phonon_done = struct_dir / '.phonon_done'
-                if phonon_done.exists():
-                    phonon_done.unlink()
+                clear_workflow_state(struct_dir, ['phonon_generated'], volume_name=volume_dir.name)
+                clear_phonon_postprocess_state(struct_dir, volume_dir)
 
             # 级联删除: 删除qha的volume_*目录(除了volume_1.0)
             for qha_volume_dir in struct_dir.glob('volume_*'):
                 if qha_volume_dir.name == 'volume_1.0':
                     continue
+                imaginary_db.invalidate(qha_volume_dir)
+                clear_workflow_state(
+                    struct_dir,
+                    ['qha_opt_generated', 'qha_generated', 'phonon_postprocessed', 'imaginary_checked'],
+                    volume_name=qha_volume_dir.name,
+                )
                 # 删除数据库中的任务
                 for task_dir in qha_volume_dir.glob('task.*'):
-                    if task_dir.is_dir() and task_dir.name != 'task_perfect':
+                    if task_dir.is_dir():
                         task_path = str(task_dir.relative_to(work_dir))
                         db.remove_task(task_path)
                         cascade_deleted += 1
                 # 删除目录
                 shutil.rmtree(qha_volume_dir)
-            # 清理.has_imag标记
-            has_imag = struct_dir / '.has_imag'
-            if has_imag.exists():
-                has_imag.unlink()
+            clear_workflow_state(struct_dir, ['qha_postprocessed'])
+            clear_path(struct_dir / '.has_imag')
 
         elif task_type == 'qha':
             # 检查opt和phonon是否完成
@@ -939,8 +1005,20 @@ def cmd_regen(args):
             for volume_dir in struct_dir.glob('volume_*'):
                 if volume_dir.name == 'volume_1.0':
                     continue
+                analyze_dir = volume_dir / 'analyze'
+                clear_path(analyze_dir / 'phonopy_params.yaml')
+                clear_path(analyze_dir / 'thermo_properties.yaml')
+                clear_path(analyze_dir / 'imaginary_check.json')
+                clear_path(analyze_dir / 'phonon_band.png')
+                clear_path(analyze_dir / 'phonon_dos.png')
+                imaginary_db.invalidate(volume_dir)
+                clear_workflow_state(
+                    struct_dir,
+                    ['phonon_postprocessed', 'imaginary_checked'],
+                    volume_name=volume_dir.name,
+                )
                 for task_dir in volume_dir.glob('task.*'):
-                    if task_dir.is_dir() and task_dir.name != 'task_perfect':
+                    if task_dir.is_dir():
                         poscar = task_dir / 'POSCAR'
                         if poscar.exists():
                             try:
@@ -962,6 +1040,7 @@ def cmd_regen(args):
                                 reset_count += 1
                             except Exception as e:
                                 print(f"  警告: {task_dir} - {e}")
+            clear_workflow_state(struct_dir, ['qha_postprocessed'])
 
     print(f"已重新生成 {regen_count} 个任务的VASP输入文件")
     print(f"已重置 {reset_count} 个任务为pending状态")
@@ -1002,6 +1081,7 @@ def cmd_sync(args):
             batch_size=5000,
             progress_callback=report_progress,
         )
+        db.backfill_workflow_states_from_tasks()
         return db, synced_counts
 
     if running and manager_mode != 'local':
@@ -1047,18 +1127,19 @@ def cmd_sync(args):
 
 
 def cmd_prepare(args):
-    """生成SLURM脚本"""
+    """按配置准备任务目录，或生成SLURM脚本。"""
     config = load_config()
     work_dir = Path(config.get('work_dir', '.')).resolve()
 
-    # 创建目录
-    subs_dir = work_dir / 'subs'
-    log_dir = work_dir / 'log'
-    subs_dir.mkdir(exist_ok=True)
-    log_dir.mkdir(exist_ok=True)
+    if args.scripts_only:
+        # 创建目录
+        subs_dir = work_dir / 'subs'
+        log_dir = work_dir / 'log'
+        subs_dir.mkdir(exist_ok=True)
+        log_dir.mkdir(exist_ok=True)
 
-    # 生成 manager 脚本
-    manager_script = f"""#!/bin/bash
+        # 生成 manager 脚本
+        manager_script = f"""#!/bin/bash
 #SBATCH --job-name=qflow_manager
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node={args.manager_cores}
@@ -1076,17 +1157,40 @@ cd {work_dir}
 qflow manager run
 """
 
-    manager_path = subs_dir / 'manager.slurm'
-    with open(manager_path, 'w') as f:
-        f.write(manager_script)
+        manager_path = subs_dir / 'manager.slurm'
+        with open(manager_path, 'w') as f:
+            f.write(manager_script)
 
-    print(f"✓ 已生成 Manager 脚本: {manager_path}")
-    print(f"  核心数: {args.manager_cores}")
-    print(f"  时间限制: {args.manager_time}")
-    print()
-    print("使用方法:")
-    print(f"  sbatch {manager_path}           # 提交 manager")
-    print(f"  qflow worker 25                 # 提交 25 个 workers")
+        print(f"✓ 已生成 Manager 脚本: {manager_path}")
+        print(f"  核心数: {args.manager_cores}")
+        print(f"  时间限制: {args.manager_time}")
+        print()
+        print("使用方法:")
+        print(f"  sbatch {manager_path}           # 提交 manager")
+        print(f"  qflow worker 25                 # 提交 25 个 workers")
+        return
+
+    running, info = _is_manager_running(config)
+    if running:
+        print(f"错误: Manager正在运行 ({info})，请先执行 'qflow manager cancel' 停止Manager后再prepare")
+        return
+
+    from .manager import Manager
+
+    print("=== QFlow 任务准备 ===")
+    print("按 config.yaml 生成/补全任务目录，不提交任务。\n")
+
+    manager = Manager(config)
+    stats = manager.prepare_tasks_once()
+
+    print("准备完成。")
+    print("\n当前数据库状态:")
+    for task_type, counts in stats.items():
+        print(f"  {task_type}: pending={counts['pending']}, running={counts['running']}, "
+              f"success={counts['success']}, failed={counts['failed']}")
+    print("\n提示:")
+    print("  qflow status        # 查看阶段进度")
+    print("  qflow manager run   # 启动 manager 继续提交任务")
 
 
 def main():
@@ -1098,6 +1202,7 @@ def main():
 示例:
   qflow manager run                    # 启动Manager进程
   qflow manager cancel                 # 取消Manager作业
+  qflow prepare                        # 按 config.yaml 生成/补全任务目录
   qflow worker run -n 3 -g "2,3"       # 启动3个worker，使用GPU 2,3
   qflow worker 10                      # 提交10个worker到SLURM
   qflow worker cancel                  # 停止所有worker
@@ -1216,13 +1321,15 @@ def main():
     # prepare子命令
     parser_prepare = subparsers.add_parser(
         'prepare',
-        help='生成SLURM脚本',
-        description='自动生成manager和worker的SLURM提交脚本'
+        help='准备任务目录或生成SLURM脚本',
+        description='默认按 config.yaml 生成/补全任务目录；可选只生成 manager SLURM 脚本'
     )
     parser_prepare.add_argument('--manager-cores', type=int, default=16,
                                help='Manager使用的核心数 (默认: 16)')
     parser_prepare.add_argument('--manager-time', type=str, default='150:00:00',
                                help='Manager时间限制 (默认: 150:00:00)')
+    parser_prepare.add_argument('--scripts-only', action='store_true',
+                               help='只生成 manager SLURM 脚本，保留旧 prepare 行为')
     parser_prepare.set_defaults(func=cmd_prepare)
 
     args = parser.parse_args()

@@ -10,6 +10,154 @@ from contextlib import contextmanager
 from .utils import load_config, get_task_type, parse_task_metadata
 
 
+class ImaginaryFrequencyDB:
+    """虚频检查缓存数据库。"""
+
+    def __init__(self, config: dict = None):
+        if config is None:
+            config = load_config()
+        self.config = config
+        self.work_dir = Path(config.get('work_dir', '.')).resolve()
+        self.db_path = self.work_dir / 'tasks.db'
+        self._init_db()
+
+    def _init_db(self):
+        """初始化虚频缓存表。"""
+        with self._get_conn() as conn:
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS imaginary_frequency_cache (
+                    volume_path TEXT PRIMARY KEY,
+                    phonopy_params_path TEXT NOT NULL,
+                    phonopy_params_mtime_ns INTEGER NOT NULL,
+                    phonopy_params_size INTEGER NOT NULL,
+                    has_imaginary INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            ''')
+            conn.execute(
+                'CREATE INDEX IF NOT EXISTS idx_imaginary_updated_at '
+                'ON imaginary_frequency_cache(updated_at)'
+            )
+            conn.commit()
+
+    @contextmanager
+    def _get_conn(self):
+        """获取数据库连接。"""
+        conn = sqlite3.connect(str(self.db_path), timeout=30)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    def _normalize_path(self, path: Path) -> str:
+        """规范化路径，优先保存为相对 work_dir 的路径。"""
+        resolved = Path(path).resolve()
+        try:
+            return str(resolved.relative_to(self.work_dir))
+        except ValueError:
+            return str(resolved)
+
+    def _build_signature(self, volume_dir: Path) -> Optional[Dict[str, object]]:
+        """构造用于缓存校验的 phonopy_params 签名。"""
+        phonopy_params = Path(volume_dir) / 'analyze' / 'phonopy_params.yaml'
+        if not phonopy_params.exists():
+            return None
+
+        stat = phonopy_params.stat()
+        return {
+            'volume_path': self._normalize_path(Path(volume_dir)),
+            'phonopy_params_path': self._normalize_path(phonopy_params),
+            'phonopy_params_mtime_ns': stat.st_mtime_ns,
+            'phonopy_params_size': stat.st_size,
+        }
+
+    def get_cached_result(self, volume_dir: Path) -> Optional[bool]:
+        """获取缓存的虚频判断结果；缓存失效时返回 None。"""
+        volume_path = self._normalize_path(Path(volume_dir))
+
+        with self._get_conn() as conn:
+            row = conn.execute(
+                '''
+                SELECT
+                    phonopy_params_path,
+                    phonopy_params_mtime_ns,
+                    phonopy_params_size,
+                    has_imaginary
+                FROM imaginary_frequency_cache
+                WHERE volume_path = ?
+                ''',
+                (volume_path,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        signature = self._build_signature(Path(volume_dir))
+        if signature is None:
+            self.invalidate(volume_dir)
+            return None
+
+        if (
+            row['phonopy_params_path'] != signature['phonopy_params_path']
+            or row['phonopy_params_mtime_ns'] != signature['phonopy_params_mtime_ns']
+            or row['phonopy_params_size'] != signature['phonopy_params_size']
+        ):
+            self.invalidate(volume_dir)
+            return None
+
+        return bool(row['has_imaginary'])
+
+    def set_cached_result(self, volume_dir: Path, has_imaginary: bool) -> bool:
+        """写入虚频判断结果缓存。"""
+        signature = self._build_signature(Path(volume_dir))
+        if signature is None:
+            self.invalidate(volume_dir)
+            return False
+
+        now = datetime.now().isoformat()
+        with self._get_conn() as conn:
+            conn.execute(
+                '''
+                INSERT INTO imaginary_frequency_cache (
+                    volume_path,
+                    phonopy_params_path,
+                    phonopy_params_mtime_ns,
+                    phonopy_params_size,
+                    has_imaginary,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(volume_path) DO UPDATE SET
+                    phonopy_params_path = excluded.phonopy_params_path,
+                    phonopy_params_mtime_ns = excluded.phonopy_params_mtime_ns,
+                    phonopy_params_size = excluded.phonopy_params_size,
+                    has_imaginary = excluded.has_imaginary,
+                    updated_at = excluded.updated_at
+                ''',
+                (
+                    signature['volume_path'],
+                    signature['phonopy_params_path'],
+                    signature['phonopy_params_mtime_ns'],
+                    signature['phonopy_params_size'],
+                    int(has_imaginary),
+                    now,
+                ),
+            )
+            conn.commit()
+        return True
+
+    def invalidate(self, volume_dir: Path):
+        """删除指定体积目录的缓存。"""
+        volume_path = self._normalize_path(Path(volume_dir))
+        with self._get_conn() as conn:
+            conn.execute(
+                'DELETE FROM imaginary_frequency_cache WHERE volume_path = ?',
+                (volume_path,),
+            )
+            conn.commit()
+
+
 class TaskDB:
     """SQLite任务数据库管理器"""
 
@@ -23,6 +171,10 @@ class TaskDB:
         'bte_fc3': 40,   # BTE fc3 位移单点
         'qha': 30,
         'plain': 20,
+    }
+
+    STATUS_ALIASES = {
+        'timeout': 'failed',
     }
 
     def __init__(self, config: dict = None, skip_backfill: bool = False):
@@ -69,10 +221,28 @@ class TaskDB:
             conn.execute('CREATE INDEX IF NOT EXISTS idx_structure_name ON tasks(structure_name)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_volume_name ON tasks(volume_name)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_pressure_name ON tasks(pressure_name)')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS workflow_state (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    structure_name TEXT NOT NULL,
+                    volume_name TEXT NOT NULL DEFAULT '',
+                    pressure_name TEXT NOT NULL DEFAULT '',
+                    stage TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'done',
+                    source_task TEXT,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(structure_name, volume_name, pressure_name, stage)
+                )
+            ''')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_workflow_stage ON workflow_state(stage)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_workflow_state ON workflow_state(state)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_workflow_structure ON workflow_state(structure_name)')
+            self._normalize_legacy_statuses(conn)
             conn.commit()
 
         if not self.skip_backfill:
             self._backfill_task_metadata()
+            self.backfill_workflow_states_from_tasks()
 
     def _ensure_column(self, conn, table_name: str, column_name: str, column_def: str):
         """确保表包含指定列。"""
@@ -84,6 +254,24 @@ class TaskDB:
     def _task_metadata(self, task_path: str) -> Dict[str, Optional[str]]:
         """解析任务元数据。"""
         return parse_task_metadata(task_path, self.config)
+
+    def _normalize_status(self, status: Optional[str]) -> Optional[str]:
+        """规范化任务状态，兼容历史别名。"""
+        if status is None:
+            return None
+        return self.STATUS_ALIASES.get(status, status)
+
+    def _normalize_legacy_statuses(self, conn):
+        """将历史状态值迁移到当前状态集合。"""
+        for old_status, new_status in self.STATUS_ALIASES.items():
+            conn.execute(
+                'UPDATE tasks SET status = ? WHERE status = ?',
+                (new_status, old_status),
+            )
+
+    def _normalize_workflow_value(self, value: Optional[str]) -> str:
+        """将 workflow_state 上下文字段规范化为空串。"""
+        return value or ''
 
     def _backfill_task_metadata(self):
         """为已有任务回填结构/体积/压强元数据。"""
@@ -107,6 +295,173 @@ class TaskDB:
                     task_path,
                 ))
             conn.commit()
+
+    def _workflow_row(self, structure_name: str, stage: str, state: str = 'done',
+                      volume_name: Optional[str] = None, pressure_name: Optional[str] = None,
+                      source_task: Optional[str] = None, updated_at: Optional[str] = None):
+        """构造 workflow_state 表的插入行。"""
+        if updated_at is None:
+            updated_at = datetime.now().isoformat()
+        return (
+            structure_name,
+            self._normalize_workflow_value(volume_name),
+            self._normalize_workflow_value(pressure_name),
+            stage,
+            state,
+            source_task,
+            updated_at,
+        )
+
+    def set_workflow_state(self, structure_name: str, stage: str, state: str = 'done',
+                           volume_name: Optional[str] = None, pressure_name: Optional[str] = None,
+                           source_task: Optional[str] = None):
+        """写入或更新 workflow_state。"""
+        row = self._workflow_row(
+            structure_name,
+            stage,
+            state=state,
+            volume_name=volume_name,
+            pressure_name=pressure_name,
+            source_task=source_task,
+        )
+        with self._get_conn() as conn:
+            conn.execute(
+                '''
+                INSERT INTO workflow_state (
+                    structure_name, volume_name, pressure_name, stage, state, source_task, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(structure_name, volume_name, pressure_name, stage) DO UPDATE SET
+                    state = excluded.state,
+                    source_task = excluded.source_task,
+                    updated_at = excluded.updated_at
+                ''',
+                row,
+            )
+            conn.commit()
+
+    def get_workflow_states(self, stage: Optional[str] = None, state: Optional[str] = None,
+                            structure_name: Optional[str] = None, volume_name: Optional[str] = None,
+                            pressure_name: Optional[str] = None) -> List[Dict]:
+        """查询 workflow_state 记录。"""
+        query = 'SELECT * FROM workflow_state WHERE 1=1'
+        params = []
+
+        if stage is not None:
+            query += ' AND stage = ?'
+            params.append(stage)
+        if state is not None:
+            query += ' AND state = ?'
+            params.append(state)
+        if structure_name is not None:
+            query += ' AND structure_name = ?'
+            params.append(structure_name)
+        if volume_name is not None:
+            query += ' AND volume_name = ?'
+            params.append(self._normalize_workflow_value(volume_name))
+        if pressure_name is not None:
+            query += ' AND pressure_name = ?'
+            params.append(self._normalize_workflow_value(pressure_name))
+
+        query += ' ORDER BY updated_at DESC'
+        with self._get_conn() as conn:
+            cursor = conn.execute(query, params)
+            return [dict(row) for row in cursor]
+
+    def has_workflow_state(self, structure_name: str, stage: str, state: Optional[str] = None,
+                           volume_name: Optional[str] = None, pressure_name: Optional[str] = None) -> bool:
+        """判断 workflow_state 是否存在。"""
+        query = '''
+            SELECT 1 FROM workflow_state
+            WHERE structure_name = ? AND volume_name = ? AND pressure_name = ? AND stage = ?
+        '''
+        params = [
+            structure_name,
+            self._normalize_workflow_value(volume_name),
+            self._normalize_workflow_value(pressure_name),
+            stage,
+        ]
+        if state is not None:
+            query += ' AND state = ?'
+            params.append(state)
+        query += ' LIMIT 1'
+
+        with self._get_conn() as conn:
+            return conn.execute(query, params).fetchone() is not None
+
+    def delete_workflow_states(self, structure_name: Optional[str] = None,
+                               volume_name: Optional[str] = None,
+                               pressure_name: Optional[str] = None,
+                               stages: Optional[Iterable[str]] = None):
+        """删除 workflow_state 记录。"""
+        query = 'DELETE FROM workflow_state WHERE 1=1'
+        params = []
+
+        if structure_name is not None:
+            query += ' AND structure_name = ?'
+            params.append(structure_name)
+        if volume_name is not None:
+            query += ' AND volume_name = ?'
+            params.append(self._normalize_workflow_value(volume_name))
+        if pressure_name is not None:
+            query += ' AND pressure_name = ?'
+            params.append(self._normalize_workflow_value(pressure_name))
+        if stages:
+            stage_list = list(stages)
+            placeholders = ', '.join('?' for _ in stage_list)
+            query += f' AND stage IN ({placeholders})'
+            params.extend(stage_list)
+
+        with self._get_conn() as conn:
+            conn.execute(query, params)
+            conn.commit()
+
+    def backfill_workflow_states_from_tasks(self):
+        """根据已有任务回填 workflow_state。"""
+        stage_by_type = {
+            'opt': 'opt_generated',
+            'phonon': 'phonon_generated',
+            'qha_opt': 'qha_opt_generated',
+            'qha': 'qha_generated',
+            'bte_opt': 'bte_opt_generated',
+            'bte_fc2': 'bte_fc2_generated',
+            'bte_fc3': 'bte_fc3_generated',
+            'plain': 'plain_generated',
+        }
+
+        with self._get_conn() as conn:
+            rows = conn.execute('''
+                SELECT DISTINCT task_type, structure_name, volume_name, pressure_name
+                FROM tasks
+                WHERE structure_name IS NOT NULL
+            ''').fetchall()
+
+            now = datetime.now().isoformat()
+            workflow_rows = []
+            for row in rows:
+                stage = stage_by_type.get(row['task_type'])
+                if stage is None:
+                    continue
+                workflow_rows.append(self._workflow_row(
+                    row['structure_name'],
+                    stage,
+                    volume_name=row['volume_name'],
+                    pressure_name=row['pressure_name'],
+                    updated_at=now,
+                ))
+
+            if workflow_rows:
+                conn.executemany(
+                    '''
+                    INSERT INTO workflow_state (
+                        structure_name, volume_name, pressure_name, stage, state, source_task, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(structure_name, volume_name, pressure_name, stage) DO NOTHING
+                    ''',
+                    workflow_rows,
+                )
+                conn.commit()
 
     @contextmanager
     def _get_conn(self):
@@ -281,6 +636,7 @@ class TaskDB:
     def update_status(self, task_path: str, status: str,
                       slurm_job_id: str = None, error_message: str = None):
         """更新任务状态"""
+        status = self._normalize_status(status)
         now = datetime.now().isoformat()
 
         with self._get_conn() as conn:
@@ -309,19 +665,24 @@ class TaskDB:
         if not task_updates:
             return 0
 
+        normalized_updates = [
+            (task_path, self._normalize_status(status))
+            for task_path, status in task_updates
+        ]
         now = datetime.now().isoformat()
         with self._get_conn() as conn:
             conn.executemany('''
                 UPDATE tasks
                 SET status = ?, updated_at = ?
                 WHERE path = ?
-            ''', [(status, now, task_path) for task_path, status in task_updates])
+            ''', [(status, now, task_path) for task_path, status in normalized_updates])
             conn.commit()
-            return len(task_updates)
+            return len(normalized_updates)
 
     def update_task_time(self, task_path: str, start_time: str, end_time: str,
                          duration_seconds: float, status: str):
         """更新任务执行时间"""
+        status = self._normalize_status(status)
         now = datetime.now().isoformat()
 
         with self._get_conn() as conn:
@@ -377,6 +738,7 @@ class TaskDB:
         params = []
 
         if status:
+            status = self._normalize_status(status)
             query += ' AND status = ?'
             params.append(status)
         if task_type:
@@ -409,6 +771,7 @@ class TaskDB:
         params = [f'{path_prefix}%']
 
         if status:
+            status = self._normalize_status(status)
             query += ' AND status = ?'
             params.append(status)
         if task_type:
@@ -603,8 +966,8 @@ class TaskDB:
 
             # phonon/qha任务
             for volume_dir in struct_dir.glob('volume_*'):
-                for task_dir in volume_dir.glob('task.*'):
-                    if not task_dir.is_dir() or task_dir.name == 'task_perfect':
+                for task_dir in sorted(volume_dir.glob('task.*')):
+                    if not task_dir.is_dir():
                         continue
                     if not (task_dir / 'POSCAR').exists():
                         continue

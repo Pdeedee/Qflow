@@ -14,6 +14,13 @@ from ase.spacegroup.symmetrize import check_symmetry
 from phonopy import Phonopy, PhonopyQHA, load
 from phonopy.structure.atoms import PhonopyAtoms
 
+PREFERRED_PERFECT_TASK_NAME = "task.perfect"
+
+
+def get_perfect_task_dir(parent_dir: Path, create: bool = False) -> Path:
+    """Return the perfect-task directory path."""
+    return Path(parent_dir) / PREFERRED_PERFECT_TASK_NAME
+
 
 def ase2phonopy(atoms: Atoms) -> PhonopyAtoms:
     """ASE Atoms转Phonopy PhonopyAtoms"""
@@ -277,9 +284,9 @@ def generate_phonon_displacements(atoms: Atoms,
         cell=perfect_supercell.cell,
         pbc=True
     )
-    task_perfect_dir = volume_dir / "task_perfect"
-    task_perfect_dir.mkdir(exist_ok=True)
-    write(str(task_perfect_dir / "POSCAR"), perfect_atoms, format="vasp", vasp5=True)
+    perfect_task_dir = get_perfect_task_dir(volume_dir, create=True)
+    perfect_task_dir.mkdir(exist_ok=True)
+    write(str(perfect_task_dir / "POSCAR"), perfect_atoms, format="vasp", vasp5=True)
 
     # 保存phonopy位移信息
     analyze_dir = volume_dir / "analyze"
@@ -314,6 +321,10 @@ def collect_forces(volume_dir: str, use_vasprun: bool = False) -> List[np.ndarra
             vasprun_file = os.path.join(task_dir, "vasprun.xml")
             if os.path.exists(vasprun_file):
                 vasprun = Vasprun(vasprun_file, parse_dos=False, parse_eigen=False)
+                if not vasprun.converged_electronic:
+                    raise ValueError(
+                        f"Unconverged VASP run for force collection: {vasprun_file}"
+                    )
                 forces.append(vasprun.ionic_steps[-1]['forces'])
 
     return forces
@@ -415,9 +426,13 @@ def check_imaginary_frequency(volume_dir: str) -> bool:
 
     try:
         phonopy = load(str(phonopy_params))
-        band_dict = phonopy.get_band_structure_dict()
+        try:
+            band_dict = phonopy.get_band_structure_dict()
+        except Exception:
+            band_dict = None
+
         if band_dict is None:
-            # 需要重新计算
+            # 保存的 phonopy_params.yaml 可能没有 band 结果，重新计算一次。
             kpoints_mesh = 50  # 使用默认值
             phonopy.run_mesh(kpoints_mesh)
             phonopy.auto_band_structure()
@@ -452,7 +467,8 @@ def collect_energies_natoms(struct_dir: str,
         volume_dir = Path(struct_dir) / f"volume_{volume}"
 
         # 优先使用energy.txt（MatterSim输出）
-        energy_file = volume_dir / "task_perfect" / "energy.txt"
+        perfect_task_dir = get_perfect_task_dir(volume_dir)
+        energy_file = perfect_task_dir / "energy.txt"
         if not energy_file.exists():
             energy_file = volume_dir / "analyze" / "energy.txt"
 
@@ -460,19 +476,42 @@ def collect_energies_natoms(struct_dir: str,
             energies.append(float(energy_file.read_text().strip()))
         elif use_vasprun:
             from pymatgen.io.vasp import Vasprun
-            vasprun_file = volume_dir / "task_perfect" / "vasprun.xml"
+            vasprun_file = perfect_task_dir / "vasprun.xml"
             if vasprun_file.exists():
                 vasprun = Vasprun(str(vasprun_file), parse_dos=False, parse_eigen=False)
                 energies.append(vasprun.final_energy)
 
         # 获取原子数
         if natoms is None:
-            poscar = volume_dir / "task_perfect" / "POSCAR"
+            poscar = perfect_task_dir / "POSCAR"
             if poscar.exists():
                 atoms = read(str(poscar))
                 natoms = len(atoms)
 
     return np.array(energies), natoms
+
+
+def get_missing_qha_static_energy_volumes(struct_dir: str,
+                                          volumes: List[float],
+                                          use_vasprun: bool = False) -> List[str]:
+    """返回缺少静态能的 QHA 体积点列表。"""
+    struct_dir = Path(struct_dir)
+    missing_volumes = []
+
+    for volume in volumes:
+        volume_dir = struct_dir / f"volume_{volume}"
+        perfect_task_dir = get_perfect_task_dir(volume_dir)
+        energy_file = perfect_task_dir / "energy.txt"
+        analyze_energy_file = volume_dir / "analyze" / "energy.txt"
+        vasprun_file = perfect_task_dir / "vasprun.xml"
+
+        if energy_file.exists() or analyze_energy_file.exists():
+            continue
+        if use_vasprun and vasprun_file.exists():
+            continue
+        missing_volumes.append(str(volume))
+
+    return missing_volumes
 
 
 def postprocess_qha(struct_dir: str,
@@ -502,6 +541,18 @@ def postprocess_qha(struct_dir: str,
         str(struct_dir), volumes, use_vasprun=use_vasprun
     )
 
+    if len(displaced_energies) != len(volumes):
+        missing_volumes = get_missing_qha_static_energy_volumes(
+            str(struct_dir),
+            volumes,
+            use_vasprun=use_vasprun,
+        )
+        raise ValueError(
+            "QHA static energies are incomplete: "
+            f"got {len(displaced_energies)}/{len(volumes)} volumes; "
+            f"missing static energies for volumes {', '.join(missing_volumes)}"
+        )
+
     # 收集热力学性质
     cv_list, entropy_list, free_energy_list = [], [], []
     real_volumes = []
@@ -521,7 +572,7 @@ def postprocess_qha(struct_dir: str,
         free_energy_list.append([v["free_energy"] for v in thermal_properties])
 
         # 获取真实体积
-        poscar = volume_dir / "task_perfect" / "POSCAR"
+        poscar = get_perfect_task_dir(volume_dir) / "POSCAR"
         atoms = read(str(poscar))
         real_volumes.append(atoms.get_volume())
 
@@ -618,11 +669,11 @@ def generate_bte_displacements(atoms: Atoms,
         ├── fc2/
         │   ├── task.000000/POSCAR   # fc2 位移
         │   ├── ...
-        │   └── task_perfect/POSCAR  # 无位移超胞
+        │   └── task.perfect/POSCAR  # 无位移超胞
         ├── fc3/
         │   ├── task.000000/POSCAR   # fc3 位移
         │   ├── ...
-        │   └── task_perfect/POSCAR
+        │   └── task.perfect/POSCAR
         └── analyze/
             └── phono3py_disp.yaml   # phono3py 位移信息
 
@@ -681,7 +732,7 @@ def generate_bte_displacements(atoms: Atoms,
 
     # 无位移参考超胞
     perfect_sc2 = ph3.phonon_supercell
-    _write_phonopy_poscar(perfect_sc2, fc2_dir / 'task_perfect')
+    _write_phonopy_poscar(perfect_sc2, get_perfect_task_dir(fc2_dir, create=True))
 
     for i, sc in enumerate(fc2_supercells):
         task_dir = fc2_dir / f'task.{i:06d}'
@@ -694,7 +745,7 @@ def generate_bte_displacements(atoms: Atoms,
 
     # 无位移参考超胞
     perfect_sc3 = ph3.supercell
-    _write_phonopy_poscar(perfect_sc3, fc3_dir / 'task_perfect')
+    _write_phonopy_poscar(perfect_sc3, get_perfect_task_dir(fc3_dir, create=True))
 
     for i, sc in enumerate(fc3_supercells):
         task_dir = fc3_dir / f'task.{i:06d}'
@@ -749,6 +800,10 @@ def collect_bte_forces(bte_dir: str, fc_type: str = 'fc2',
             if vasprun_file.exists():
                 from pymatgen.io.vasp import Vasprun
                 vasprun = Vasprun(str(vasprun_file), parse_dos=False, parse_eigen=False)
+                if not vasprun.converged_electronic:
+                    raise ValueError(
+                        f"Unconverged VASP run for force collection: {vasprun_file}"
+                    )
                 forces.append(np.array(vasprun.ionic_steps[-1]['forces']))
             else:
                 raise FileNotFoundError(f"No forces found in {task_dir}")
