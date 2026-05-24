@@ -97,9 +97,12 @@ class Manager:
         self.refine_structure = opt_config.get('refine_structure', False)
 
         # 工作流开关: bte: true/false, qha: true/false
-        self.enable_qha = config.get('manager', {}).get('qha', True)
-        self.enable_bte = config.get('manager', {}).get('bte', False)
-        self.plain_submit = config.get('manager', {}).get('plain_submit', False)
+        manager_config = config.get('manager', {})
+        self.enable_qha = manager_config.get('qha', True)
+        self.enable_bte = manager_config.get('bte', False)
+        self.plain_submit = manager_config.get('plain_submit', False)
+        self.plain_submit_scan_interval = int(manager_config.get('plain_submit_scan_interval', 600))
+        self._last_plain_submit_scan = 0.0
 
         # INCAR设置在每次提交任务时实时从config.yaml读取（见_generate_vasp_inputs）
 
@@ -156,16 +159,12 @@ class Manager:
         return task_dirs
 
     def _check_registered_submit_tasks_completed(self, parent_dir: Path, task_type: str) -> bool:
-        """检查目录下所有 task.* 是否已注册且成功。"""
-        task_dirs = self._register_submit_tasks(parent_dir, task_type)
-        if not task_dirs:
+        """检查数据库中该目录下的任务是否全部成功。"""
+        prefix = f"{parent_dir.relative_to(self.work_dir)}/"
+        tasks = self.db.get_tasks_by_prefix(prefix, task_type=task_type)
+        if not tasks:
             return False
-
-        for task_dir in task_dirs:
-            task = self._get_db_task(task_dir)
-            if not task or task['status'] != 'success':
-                return False
-        return True
+        return all(task['status'] == 'success' for task in tasks)
 
     def _get_active_slurm_jobs(self, job_ids: Optional[Iterable[str]] = None) -> Optional[Set[str]]:
         """获取当前活跃的 SLURM job id；查询失败时返回 None。"""
@@ -630,6 +629,20 @@ class Manager:
             '递归注册 opt/task.* 目录'
         )
 
+    def prepare_plain_submit_tasks(self):
+        """plain_submit 模式下低频注册新任务，避免 manager 每轮递归扫描。"""
+        now = time.time()
+        if (
+            self._last_plain_submit_scan
+            and self.plain_submit_scan_interval > 0
+            and now - self._last_plain_submit_scan < self.plain_submit_scan_interval
+        ):
+            return self.collect_statistics()
+
+        self._last_plain_submit_scan = now
+        self.register_plain_submit_tasks()
+        return self.collect_statistics()
+
     def reconcile_tracked_tasks(self):
         """启动恢复：仅修正已跟踪任务中的缺失目录和 success 标记。"""
         logger.info("=== 恢复已跟踪任务状态 ===")
@@ -1041,6 +1054,65 @@ class Manager:
             'qha_opt_success': qha_opt_success,
             'qha_registered': qha_registered,
         }
+
+    def _build_bte_scan_state(self) -> Dict[str, object]:
+        """批量加载 BTE 工作流常用状态，避免按压强点反复查库。"""
+        opt_success = {
+            task['structure_name']
+            for task in self.db.get_tasks(task_type='opt', status='success')
+            if task.get('structure_name')
+        }
+
+        bte_opt_success = {
+            (task['structure_name'], task['pressure_name'])
+            for task in self.db.get_tasks(task_type='bte_opt', status='success')
+            if task.get('structure_name') and task.get('pressure_name')
+        }
+
+        task_counts = {}
+        for task_type in ('bte_fc2', 'bte_fc3', 'bte_postprocess'):
+            counts = {}
+            for task in self.db.get_tasks(task_type=task_type):
+                structure_name = task.get('structure_name')
+                pressure_name = task.get('pressure_name')
+                if not structure_name or not pressure_name:
+                    continue
+                key = (structure_name, pressure_name)
+                total, success = counts.get(key, (0, 0))
+                counts[key] = (
+                    total + 1,
+                    success + (1 if task['status'] == 'success' else 0),
+                )
+            task_counts[task_type] = counts
+
+        return {
+            'opt_success': opt_success,
+            'bte_opt_success': bte_opt_success,
+            'task_counts': task_counts,
+        }
+
+    def _bte_tasks_registered(self, scan_state: Dict[str, object], task_type: str,
+                              structure_name: str, pressure_name: str) -> bool:
+        counts = scan_state['task_counts'].get(task_type, {})
+        total, _ = counts.get((structure_name, pressure_name), (0, 0))
+        return total > 0
+
+    def _bte_tasks_completed(self, scan_state: Dict[str, object], task_type: str,
+                             structure_name: str, pressure_name: str) -> bool:
+        counts = scan_state['task_counts'].get(task_type, {})
+        total, success = counts.get((structure_name, pressure_name), (0, 0))
+        return total > 0 and total == success
+
+    def _bte_record_registered_tasks(self, scan_state: Dict[str, object], task_type: str,
+                                     structure_name: str, pressure_name: str, task_count: int):
+        """将本轮新注册的 BTE 任务写回内存状态，避免立即重扫数据库。"""
+        if not scan_state or task_count <= 0:
+            return
+
+        task_counts = scan_state['task_counts'].setdefault(task_type, {})
+        key = (structure_name, pressure_name)
+        total, success = task_counts.get(key, (0, 0))
+        task_counts[key] = (max(total, task_count), success)
 
     def _refine_structure(self, poscar_path: Path) -> None:
         """使用pymatgen标准化结构（保持primitive cell）"""
@@ -1708,15 +1780,21 @@ class Manager:
         """获取 BTE 压强列表 (GPa)"""
         return self.bte_config.get('pressures', [0])
 
-    def generate_bte_pressure_opt_tasks(self):
+    def generate_bte_pressure_opt_tasks(self, struct_dirs: Optional[List[Path]] = None,
+                                        scan_state: Optional[Dict[str, object]] = None):
         """0GPa opt 完成后，为每个压强点生成带 PSTRESS 的 opt 任务"""
         if not self.enable_bte:
             return
 
         logger.info("=== 生成BTE压强优化任务 ===")
+        if struct_dirs is None:
+            struct_dirs = self.get_all_structures()
+        if scan_state is None:
+            scan_state = self._build_bte_scan_state()
 
-        for struct_dir in self.get_all_structures():
-            if not self.check_opt_completed(struct_dir):
+        opt_success = scan_state['opt_success']
+        for struct_dir in struct_dirs:
+            if struct_dir.name not in opt_success:
                 continue
 
             atoms = self._get_optimized_structure(struct_dir)
@@ -1749,28 +1827,34 @@ class Manager:
                 self.db.add_task(task_path, 'bte_opt')
                 marker.touch()
 
-    def generate_bte_tasks(self):
+    def generate_bte_tasks(self, struct_dirs: Optional[List[Path]] = None,
+                           scan_state: Optional[Dict[str, object]] = None):
         """压强 opt 完成后，生成 BTE fc2 位移任务"""
         if not self.enable_bte:
             return
 
         logger.info("=== 生成BTE fc2任务 ===")
+        if struct_dirs is None:
+            struct_dirs = self.get_all_structures()
+        if scan_state is None:
+            scan_state = self._build_bte_scan_state()
 
-        for struct_dir in self.get_all_structures():
+        bte_opt_success = scan_state['bte_opt_success']
+        for struct_dir in struct_dirs:
             for pressure in self._get_bte_pressures():
                 p_dir = struct_dir / f'P_{pressure:02d}GPa'
+                pressure_name = p_dir.name
                 opt_dir = p_dir / 'opt'
                 bte_dir = p_dir / 'bte'
                 fc2_dir = bte_dir / 'fc2'
                 fc2_marker = self._generation_marker(struct_dir, f'bte_fc2__{p_dir.name}')
                 if fc2_marker.exists():
-                    if self._get_tasks_under(fc2_dir, task_type='bte_fc2'):
+                    if self._bte_tasks_registered(scan_state, 'bte_fc2', struct_dir.name, pressure_name):
                         continue
                     fc2_marker.unlink()
 
                 # 压强 opt 必须完成
-                opt_task = self._get_db_task(opt_dir)
-                if not opt_dir.exists() or not opt_task or opt_task['status'] != 'success':
+                if (struct_dir.name, pressure_name) not in bte_opt_success:
                     continue
 
                 cache_key = f"{struct_dir.name}_P{pressure}"
@@ -1782,26 +1866,36 @@ class Manager:
 
                 if bte_dir.exists():
                     if fc2_dir.exists():
-                        self._register_submit_tasks(fc2_dir, 'bte_fc2')
+                        task_dirs = self._register_submit_tasks(fc2_dir, 'bte_fc2')
+                        self._bte_record_registered_tasks(
+                            scan_state, 'bte_fc2', struct_dir.name, pressure_name, len(task_dirs)
+                        )
 
                     fc2_marker.touch()
                     self._bte_generated.add(cache_key)
 
-    def generate_bte_fc3_tasks(self):
+    def generate_bte_fc3_tasks(self, struct_dirs: Optional[List[Path]] = None,
+                               scan_state: Optional[Dict[str, object]] = None):
         """fc2 完成后检查虚频，无虚频才注册 fc3 任务"""
         if not self.enable_bte:
             return
 
         logger.info("=== 检查虚频并生成BTE fc3任务 ===")
+        if struct_dirs is None:
+            struct_dirs = self.get_all_structures()
+        if scan_state is None:
+            scan_state = self._build_bte_scan_state()
 
-        for struct_dir in self.get_all_structures():
+        for struct_dir in struct_dirs:
             for pressure in self._get_bte_pressures():
                 p_dir = struct_dir / f'P_{pressure:02d}GPa'
+                pressure_name = p_dir.name
                 bte_dir = p_dir / 'bte'
                 fc3_dir = bte_dir / 'fc3'
                 fc3_marker = self._generation_marker(struct_dir, f'bte_fc3__{p_dir.name}')
                 if fc3_marker.exists():
-                    if self._get_tasks_under(fc3_dir, task_type='bte_fc3') or (bte_dir / '.has_imaginary').exists():
+                    if (self._bte_tasks_registered(scan_state, 'bte_fc3', struct_dir.name, pressure_name)
+                            or (bte_dir / '.has_imaginary').exists()):
                         continue
                     fc3_marker.unlink()
 
@@ -1814,7 +1908,7 @@ class Manager:
                 if (bte_dir / '.fc2_checked').exists():
                     continue
 
-                if not self._check_fc_completed(bte_dir / 'fc2'):
+                if not self._bte_tasks_completed(scan_state, 'bte_fc2', struct_dir.name, pressure_name):
                     continue
 
                 logger.info(f"  [BTE] {struct_dir.name} P={pressure}GPa: fc2完成，检查虚频...")
@@ -1833,6 +1927,9 @@ class Manager:
                 if fc3_dir.exists():
                     task_dirs = self._register_submit_tasks(fc3_dir, 'bte_fc3')
                     logger.info(f"    注册 {len(task_dirs)} 个fc3任务")
+                    self._bte_record_registered_tasks(
+                        scan_state, 'bte_fc3', struct_dir.name, pressure_name, len(task_dirs)
+                    )
                     fc3_marker.touch()
 
     def _prepare_bte_displacements_at_pressure(self, struct_dir: Path, p_dir: Path):
@@ -1912,22 +2009,30 @@ class Manager:
         task_type = 'bte_fc2' if fc_dir.name == 'fc2' else 'bte_fc3'
         return self._check_registered_submit_tasks_completed(fc_dir, task_type)
 
-    def generate_bte_postprocess_tasks(self):
+    def generate_bte_postprocess_tasks(self, struct_dirs: Optional[List[Path]] = None,
+                                       scan_state: Optional[Dict[str, object]] = None):
         """BTE 后处理任务（每个压强点独立）"""
         if not self.enable_bte:
             return
 
         logger.info("=== 生成BTE后处理任务 ===")
+        if struct_dirs is None:
+            struct_dirs = self.get_all_structures()
+        if scan_state is None:
+            scan_state = self._build_bte_scan_state()
 
-        for struct_dir in self.get_all_structures():
+        for struct_dir in struct_dirs:
             for pressure in self._get_bte_pressures():
                 p_dir = struct_dir / f'P_{pressure:02d}GPa'
+                pressure_name = p_dir.name
                 bte_dir = p_dir / 'bte'
                 analyze_dir = bte_dir / 'analyze'
                 task_dir = analyze_dir / 'task.BTE'
+                cache_key = f"{struct_dir.name}_P{pressure}"
                 post_marker = self._generation_marker(struct_dir, f'bte_post__{p_dir.name}')
                 if post_marker.exists():
-                    if task_dir.exists() or self._get_db_task(task_dir):
+                    if (self._bte_tasks_registered(scan_state, 'bte_postprocess', struct_dir.name, pressure_name)
+                            or task_dir.exists()):
                         self._bte_postprocess_generated.add(cache_key)
                         continue
                     post_marker.unlink()
@@ -1935,18 +2040,22 @@ class Manager:
                 if not bte_dir.exists():
                     continue
 
-                cache_key = f"{struct_dir.name}_P{pressure}"
                 if cache_key in self._bte_postprocess_generated:
                     continue
 
                 # fc2 + fc3 都完成才做后处理
-                if not (self._check_fc_completed(bte_dir / 'fc2') and
-                        self._check_fc_completed(bte_dir / 'fc3')):
+                if not (
+                    self._bte_tasks_completed(scan_state, 'bte_fc2', struct_dir.name, pressure_name)
+                    and self._bte_tasks_completed(scan_state, 'bte_fc3', struct_dir.name, pressure_name)
+                ):
                     continue
 
                 if task_dir.exists():
                     task_path = str(task_dir.relative_to(self.work_dir))
                     self.db.add_task(task_path, 'bte_postprocess')
+                    self._bte_record_registered_tasks(
+                        scan_state, 'bte_postprocess', struct_dir.name, pressure_name, 1
+                    )
                     post_marker.touch()
                     self._bte_postprocess_generated.add(cache_key)
                     continue
@@ -1957,6 +2066,9 @@ class Manager:
 
                 task_path = str(task_dir.relative_to(self.work_dir))
                 self.db.add_task(task_path, 'bte_postprocess')
+                self._bte_record_registered_tasks(
+                    scan_state, 'bte_postprocess', struct_dir.name, pressure_name, 1
+                )
                 post_marker.touch()
                 self._bte_postprocess_generated.add(cache_key)
 
@@ -1979,8 +2091,7 @@ class Manager:
     def prepare_tasks_once(self):
         """按当前配置执行一次任务目录准备，不提交任务。"""
         if self.plain_submit:
-            self.sync_plain_submit_tasks()
-            return self.collect_statistics()
+            return self.prepare_plain_submit_tasks()
 
         struct_dirs = self.get_all_structures()
         self.generate_opt_tasks(struct_dirs)
@@ -1992,10 +2103,11 @@ class Manager:
             self.generate_qha_phonon_tasks(struct_dirs, qha_scan_state)
 
         if self.enable_bte:
-            self.generate_bte_pressure_opt_tasks()
-            self.generate_bte_tasks()
-            self.generate_bte_fc3_tasks()
-            self.generate_bte_postprocess_tasks()
+            bte_scan_state = self._build_bte_scan_state()
+            self.generate_bte_pressure_opt_tasks(struct_dirs, bte_scan_state)
+            self.generate_bte_tasks(struct_dirs, bte_scan_state)
+            self.generate_bte_fc3_tasks(struct_dirs, bte_scan_state)
+            self.generate_bte_postprocess_tasks(struct_dirs, bte_scan_state)
 
         return self.collect_statistics()
 
