@@ -419,7 +419,7 @@ def cmd_status(args):
         for task_data in running_tasks:
             task_path = task_data['path']
             raw_task_type = task_data.get('task_type', 'unknown')
-            job_id = path_to_jobid.get(task_path, '-')
+            job_id = task_data.get('slurm_job_id') or path_to_jobid.get(task_path, '-')
             slurm_state = jobid_to_slurm_state.get(job_id, '-')
             updated_at_str = task_data.get('updated_at')
             elapsed_min = 0
@@ -583,6 +583,7 @@ def cmd_cancel(args):
     work_dir = Path(config.get('work_dir', '.')).resolve()
     jobs_file = work_dir / 'sbatch_jobs.json'
     from .task_db import TaskDB
+    db = TaskDB(config, skip_backfill=True)
 
     # 1. 取消 manager
     if _cancel_manager():
@@ -593,8 +594,15 @@ def cmd_cancel(args):
     if jobs_file.exists():
         job_mapping = json.loads(jobs_file.read_text())
 
+    running_tasks = db.get_running_tasks()
+    running_job_ids = [
+        task_data.get('slurm_job_id')
+        for task_data in running_tasks
+        if task_data.get('slurm_job_id')
+    ]
+
     task_job_ids = []
-    if job_mapping:
+    if running_job_ids or job_mapping:
         result = subprocess.run(
             "squeue -u $USER -o '%.18i' -h",
             shell=True,
@@ -604,7 +612,8 @@ def cmd_cancel(args):
 
         if result.returncode == 0:
             active_job_ids = set(result.stdout.strip().split())
-            task_job_ids = [job_id for job_id in job_mapping if job_id in active_job_ids]
+            candidate_job_ids = set(running_job_ids) | set(job_mapping)
+            task_job_ids = [job_id for job_id in candidate_job_ids if job_id in active_job_ids]
 
         if task_job_ids:
             print(f"找到当前 manager 提交的 {len(task_job_ids)} 个任务作业")
@@ -622,13 +631,13 @@ def cmd_cancel(args):
     else:
         print(f"\n总共取消了 {cancelled} 个作业")
 
-    if job_mapping:
-        db = TaskDB(config, skip_backfill=True)
-        task_paths = []
+    if running_tasks or job_mapping:
+        task_paths = [task_data['path'] for task_data in running_tasks]
         for rel_path in dict.fromkeys(job_mapping.values()):
-            task_data = db.get_task(rel_path)
-            if task_data and task_data['status'] == 'running':
-                task_paths.append(rel_path)
+            if rel_path not in task_paths:
+                task_data = db.get_task(rel_path)
+                if task_data and task_data['status'] == 'running':
+                    task_paths.append(rel_path)
 
         reset_count = db.reset_tasks_to_pending_bulk(task_paths)
         for rel_path in task_paths:

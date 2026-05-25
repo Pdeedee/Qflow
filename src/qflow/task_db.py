@@ -218,6 +218,10 @@ class TaskDB:
             # 创建索引加速查询
             conn.execute('CREATE INDEX IF NOT EXISTS idx_status ON tasks(status)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_priority ON tasks(priority DESC, created_at ASC)')
+            conn.execute('''
+                CREATE INDEX IF NOT EXISTS idx_status_priority_created
+                ON tasks(status, priority DESC, created_at ASC)
+            ''')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_task_type ON tasks(task_type)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_structure_name ON tasks(structure_name)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_volume_name ON tasks(volume_name)')

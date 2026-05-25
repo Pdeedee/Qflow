@@ -880,9 +880,6 @@ class Manager:
             job_id = result.stdout.strip().split()[-1]
             logger.info(f"  提交任务: {task_dir.name} -> job {job_id}")
 
-            # 保存job_id映射
-            self._save_job_mapping(job_id, task_dir)
-
             return job_id
         else:
             logger.error(f"  提交失败: {task_dir.name}\n{result.stderr}")
@@ -895,6 +892,20 @@ class Manager:
             jobs = json.loads(self.jobs_file.read_text())
 
         jobs[job_id] = str(task_path.relative_to(self.work_dir))
+        self.jobs_file.write_text(json.dumps(jobs, indent=2))
+
+    def _save_job_mappings(self, job_mappings: List[Tuple[str, str]]):
+        """批量保存 job_id -> task_path 映射，避免每次 sbatch 后重写整个 JSON。"""
+        if not job_mappings:
+            return
+
+        jobs = {}
+        if self.jobs_file.exists():
+            jobs = json.loads(self.jobs_file.read_text())
+
+        for job_id, task_path in job_mappings:
+            jobs[job_id] = task_path
+
         self.jobs_file.write_text(json.dumps(jobs, indent=2))
 
     def _remove_job_mapping(self, job_id: str):
@@ -937,8 +948,7 @@ class Manager:
         logger.info(f"最大并发任务数: {max_workers}")
 
         # 从队列获取running任务数
-        running_tasks = self.db.get_tasks(status='running')
-        current_running = len(running_tasks)
+        current_running = self.db.get_running_count()
 
         logger.info(f"当前运行任务数: {current_running}")
 
@@ -950,6 +960,7 @@ class Manager:
         logger.info(f"还可提交 {slots_available} 个任务")
 
         submitted = 0
+        new_job_mappings = []
 
         # 从队列获取pending任务并提交
         while submitted < slots_available:
@@ -989,11 +1000,13 @@ class Manager:
             job_id = self.submit_sbatch_task(task_dir, task_type=task_type)
             if job_id:
                 self.db.update_status(task_path_str, 'running', slurm_job_id=job_id)
+                new_job_mappings.append((job_id, task_path_str))
                 submitted += 1
             else:
                 # 提交失败，标记为failed
                 self.db.update_status(task_path_str, 'failed')
 
+        self._save_job_mappings(new_job_mappings)
         if submitted > 0:
             logger.info(f"提交了 {submitted} 个新任务 (当前运行: {current_running + submitted}/{max_workers})")
 
