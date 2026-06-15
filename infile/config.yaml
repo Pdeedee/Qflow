@@ -12,6 +12,7 @@ manager:
   qha: true                          # 是否启用 QHA 工作流
   bte: false                         # 是否启用 BTE 工作流
   plain_submit: false                # true 时只递归扫描并提交已有 task.*，不生成 opt/phonon/qha/bte 任务，也不做后处理
+  mode: local                        # local / sbatch / remote
 
 worker:
   mode: vasp                         # mattersim 或 vasp；只有 vasp 模式才会生成 INCAR/KPOINTS/POTCAR
@@ -29,6 +30,17 @@ slurm:
   extra_commands:
     # 提交脚本里会原样执行，可用于补环境变量、source 某些软件环境等
     - export LD_LIBRARY_PATH=/home/share/apps/openmpi-5.0.7/lib:/home/share/apps/scalapack-2.2.2/lib:/home/share/apps/fftw-3.3.10/lib:/home/share/apps/openblas/lib:$LD_LIBRARY_PATH
+
+remote:
+  # manager.mode: remote 时使用；Manager 在本地运行，任务批量同步到远端并远程 sbatch。
+  ssh_hostname: "ssh.paracloud.com"
+  ssh_username: "sch9797@BSCC-T6"
+  ssh_port: 2222
+  ssh_timeout: 20
+  ssh_key_filename: "/home/liuzf/.ssh/id_ecdsa"
+  remote_root: "/public1/home/sch9797/qflow"
+  project_name: null                 # null 时使用当前 work_dir 目录名
+  fetch_batch_size: 10               # 累积多少个结束任务后批量回传结果；不足但没有活跃任务时也会回传
 
 opt:
   fmax: 0.01                         # 几何优化收敛阈值（当前更多是语义配置）

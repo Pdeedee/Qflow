@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 from typing import Iterable, List, Set, Optional, Dict, Tuple
 from datetime import datetime
+from email.utils import parsedate_to_datetime
 
 from .logger import logger
 
@@ -24,6 +25,7 @@ from .utils import (
 from .template import generate_task_script
 from .task_db import TaskDB, ImaginaryFrequencyDB
 from .submit_registry import SubmitTaskScanner
+from .remote import RemoteRunner
 from .phonon_utils import (
     generate_phonon_displacements,
     postprocess_phonon,
@@ -101,8 +103,11 @@ class Manager:
         self.enable_qha = manager_config.get('qha', True)
         self.enable_bte = manager_config.get('bte', False)
         self.plain_submit = manager_config.get('plain_submit', False)
+        self.manager_mode = manager_config.get('mode', 'sbatch')
         self.plain_submit_scan_interval = int(manager_config.get('plain_submit_scan_interval', 600))
         self._last_plain_submit_scan = 0.0
+        remote_config = config.get('remote', {}) or {}
+        self.remote_fetch_batch_size = max(1, int(remote_config.get('fetch_batch_size', 1)))
 
         # INCAR设置在每次提交任务时实时从config.yaml读取（见_generate_vasp_inputs）
 
@@ -118,8 +123,12 @@ class Manager:
         # SQLite任务数据库
         logger.info("正在初始化任务数据库...")
         self.db = TaskDB(config, skip_backfill=self.plain_submit)
+        reset_count = self.db.reset_submitting_tasks()
+        if reset_count:
+            logger.info(f"重置 {reset_count} 个未完成提交的任务为 pending")
         self.imaginary_db = ImaginaryFrequencyDB(config)
         self.submit_scanner = SubmitTaskScanner(self.work_dir, self.structures_dir)
+        self.remote_runner = RemoteRunner(config) if self.manager_mode == 'remote' else None
         self._backfill_workflow_state_from_markers()
 
         # 标记已处理的结构，避免重复
@@ -168,6 +177,9 @@ class Manager:
 
     def _get_active_slurm_jobs(self, job_ids: Optional[Iterable[str]] = None) -> Optional[Set[str]]:
         """获取当前活跃的 SLURM job id；查询失败时返回 None。"""
+        if self.remote_runner is not None:
+            return self.remote_runner.active_job_ids(job_ids or [])
+
         normalized_job_ids = None
         if job_ids is not None:
             normalized_job_ids = sorted({str(job_id).strip() for job_id in job_ids if str(job_id).strip()})
@@ -204,6 +216,27 @@ class Manager:
                 logger.warning(f"查询 squeue 失败，跳过 running 状态校正: {query_scope}")
             return None
         return {job_id for job_id in result.stdout.strip().split() if job_id}
+
+    def _sync_remote_finished_task(self, task_path_str: str):
+        if self.remote_runner is None:
+            return
+        try:
+            self.remote_runner.rsync_fetch_task(task_path_str)
+        except Exception as exc:
+            logger.warning(f"远程结果下载失败 {task_path_str}: {exc}")
+
+    def _sync_remote_finished_tasks(self, task_path_strs: List[str]):
+        if self.remote_runner is None or not task_path_strs:
+            return
+        try:
+            self.remote_runner.rsync_fetch_tasks(task_path_strs)
+            logger.info(f"批量下载 {len(task_path_strs)} 个远程任务结果")
+            self.remote_runner.remove_remote_tasks(task_path_strs)
+            logger.info(f"清理 {len(task_path_strs)} 个远程任务目录")
+        except Exception as exc:
+            logger.warning(f"远程批量结果下载失败，改为逐个下载: {exc}")
+            for task_path_str in task_path_strs:
+                self._sync_remote_finished_task(task_path_str)
 
     def _task_relpath(self, task_path: Path) -> str:
         """获取相对 work_dir 的任务路径。"""
@@ -361,7 +394,37 @@ class Manager:
             for task_data in self.db.get_tasks(status=status):
                 task_dir = self.work_dir / task_data['path']
                 if task_dir.exists():
-                    self._extract_task_time(task_dir, status)
+                    try:
+                        self._extract_task_time(task_dir, status)
+                    except Exception as exc:
+                        logger.warning(f"任务时间解析失败，跳过 {task_data['path']}: {exc}")
+
+    def _parse_slurm_date(self, date_str: str) -> Optional[str]:
+        """Parse common shell date formats from SLURM logs into ISO text."""
+        date_str = date_str.strip()
+        if not date_str:
+            return None
+
+        try:
+            return datetime.fromisoformat(date_str).isoformat()
+        except ValueError:
+            pass
+
+        for fmt in (
+            '%a %b %d %H:%M:%S %Z %Y',
+            '%a %b %d %I:%M:%S %p %Z %Y',
+            '%a %b %e %H:%M:%S %Z %Y',
+            '%a %b %e %I:%M:%S %p %Z %Y',
+        ):
+            try:
+                return datetime.strptime(date_str, fmt).isoformat()
+            except ValueError:
+                continue
+
+        try:
+            return parsedate_to_datetime(date_str).isoformat()
+        except (TypeError, ValueError):
+            return None
 
     def _extract_task_time(self, task_dir: Path, task_status: str):
         """从任务目录的.task_time文件提取执行时间并更新到队列"""
@@ -411,7 +474,9 @@ class Manager:
         for line in lines:
             if 'Date:' in line:
                 date_str = line.split('Date:')[-1].strip()
-                start_time = datetime.strptime(date_str, '%a %b %d %I:%M:%S %p %Z %Y').isoformat()
+                start_time = self._parse_slurm_date(date_str)
+                if start_time is None:
+                    logger.warning(f"无法解析 SLURM 日志时间 {task_rel}: {date_str}")
                 break
 
         if start_time:
@@ -697,6 +762,7 @@ class Manager:
         status_updates = []
         pending_paths = []
         stale_job_ids = []
+        finished_count = 0
 
         for task_data in running_tasks:
             task_path_str = task_data['path']
@@ -720,10 +786,10 @@ class Manager:
                 stale_job_ids.append(slurm_job_id)
                 recovered['pending'] += 1
             elif active_jobs is not None and slurm_job_id not in active_jobs:
-                clear_task_status(task_dir, self.config, statuses=['running', 'failed'])
-                status_updates.append((task_path_str, 'failed'))
+                clear_task_status(task_dir, self.config, statuses=['running'])
+                status_updates.append((task_path_str, 'finished'))
                 stale_job_ids.append(slurm_job_id)
-                recovered['failed'] += 1
+                finished_count += 1
 
         self.db.reset_tasks_to_pending_bulk(pending_paths)
         self.db.update_status_bulk(status_updates)
@@ -734,17 +800,66 @@ class Manager:
             f"success={recovered['success']}, "
             f"failed={recovered['failed']}, "
             f"pending={recovered['pending']}, "
+            f"finished={finished_count}, "
             f"removed={recovered['removed']}"
         )
         return recovered
+
+    def sync_finished_tasks_status(self, force: bool = False):
+        """批量回传 finished 任务结果并落盘为 success/failed。"""
+        finished_tasks = self.db.get_finished_tasks()
+        if not finished_tasks:
+            return
+
+        if (
+            not force
+            and len(finished_tasks) < self.remote_fetch_batch_size
+            and self.db.get_running_count() > 0
+        ):
+            logger.info(
+                f"已有 {len(finished_tasks)} 个 finished 任务，等待达到批量回传阈值 "
+                f"{self.remote_fetch_batch_size}"
+            )
+            return
+
+        status_updates = []
+        stale_job_ids = []
+        synced = 0
+        failed = 0
+        task_paths = [task_data['path'] for task_data in finished_tasks]
+        self._sync_remote_finished_tasks(task_paths)
+
+        for task_data in finished_tasks:
+            task_path_str = task_data['path']
+            task_path = self.work_dir / task_path_str
+            slurm_job_id = task_data.get('slurm_job_id')
+            if (task_path / '.success').exists():
+                clear_task_status(task_path, self.config, statuses=['running', 'failed'])
+                status_updates.append((task_path_str, 'success'))
+                synced += 1
+            else:
+                clear_task_status(task_path, self.config, statuses=['running', 'failed'])
+                status_updates.append((task_path_str, 'failed'))
+                failed += 1
+                logger.warning(f"任务 {task_path_str} 已结束但未找到成功标记，标记为failed")
+            stale_job_ids.append(slurm_job_id)
+
+        self.db.update_status_bulk(status_updates)
+        self._remove_job_mappings(stale_job_ids)
+        if synced:
+            logger.info(f"同步了 {synced} 个finished任务状态")
+        if failed:
+            logger.info(f"标记了 {failed} 个finished任务为failed")
 
     def sync_running_tasks_status(self):
         """快速同步：只检查running任务的文件系统状态"""
         running_tasks = self.db.get_running_tasks()
         if not running_tasks:
+            self.sync_finished_tasks_status(force=True)
             return
 
         synced = 0
+        finished_count = 0
         reset_to_failed = 0
         reset_to_pending = 0
         running_job_ids = [task_data.get('slurm_job_id') for task_data in running_tasks if task_data.get('slurm_job_id')]
@@ -775,11 +890,10 @@ class Manager:
                 reset_to_pending += 1
                 logger.warning(f"任务 {task_path_str} 缺少 slurm_job_id，重置为pending")
             elif active_jobs is not None and slurm_job_id not in active_jobs:
-                clear_task_status(task_path, self.config, statuses=['running', 'failed'])
-                status_updates.append((task_path_str, 'failed'))
+                clear_task_status(task_path, self.config, statuses=['running'])
+                status_updates.append((task_path_str, 'finished'))
                 stale_job_ids.append(slurm_job_id)
-                reset_to_failed += 1
-                logger.warning(f"任务 {task_path_str} SLURM job {slurm_job_id} 已消失，标记为failed")
+                finished_count += 1
 
         self.db.reset_tasks_to_pending_bulk(pending_paths)
         self.db.update_status_bulk(status_updates)
@@ -787,6 +901,8 @@ class Manager:
 
         if synced > 0:
             logger.info(f"同步了 {synced} 个running任务状态")
+        if finished_count > 0:
+            logger.info(f"发现 {finished_count} 个远程任务结束，标记为finished")
         if reset_to_failed > 0:
             logger.info(f"标记了 {reset_to_failed} 个异常终止任务为failed")
         if reset_to_pending > 0:
@@ -853,19 +969,7 @@ class Manager:
 
         Returns: job_id或None（失败时）
         """
-        # 生成任务名称
-        task_name = self._generate_task_name(task_dir)
-
-        # 生成sbatch脚本
-        script_content = generate_task_script(self.config, task_name, task_type=task_type)
-
-        # 写入脚本文件到任务目录
-        script_file = task_dir / 'run.sbatch'
-        script_file.write_text(script_content)
-        script_file.chmod(0o755)
-
-        # 提交前清理旧兼容标记和错误日志，success 标记保留为跳过依据
-        clear_task_status(task_dir, self.config, remove_error_log=True)
+        self.prepare_task_for_submit(task_dir, task_type=task_type)
 
         # 提交sbatch
         result = subprocess.run(
@@ -884,6 +988,78 @@ class Manager:
         else:
             logger.error(f"  提交失败: {task_dir.name}\n{result.stderr}")
             return None
+
+    def prepare_task_for_submit(self, task_dir: Path, task_type: str = 'opt'):
+        """Generate run.sbatch and clear stale runtime markers before submission."""
+        task_name = self._generate_task_name(task_dir)
+        script_content = generate_task_script(self.config, task_name, task_type=task_type)
+
+        script_file = task_dir / 'run.sbatch'
+        script_file.write_text(script_content)
+        script_file.chmod(0o755)
+
+        clear_task_status(task_dir, self.config, remove_error_log=True)
+
+    def _vasp_input_type(self, task_type: str) -> str:
+        vasp_type_map = {
+            'opt': 'opt', 'qha_opt': 'qha_opt', 'phonon': 'phonon',
+            'bte_opt': 'bte_opt', 'bte_fc2': 'phonon', 'bte_fc3': 'phonon',
+            'qha': 'phonon', 'plain': 'plain',
+        }
+        return vasp_type_map.get(task_type, 'phonon')
+
+    def _prepare_pending_task(self, task_data: Dict) -> Optional[Tuple[str, Path, str]]:
+        task_path_str = task_data['path']
+        task_dir = self.work_dir / task_path_str
+        task_type = task_data.get('task_type', 'opt')
+
+        requires_poscar = task_type != 'bte_postprocess'
+        if not task_dir.exists() or (requires_poscar and not (task_dir / 'POSCAR').exists()):
+            self.db.update_status(task_path_str, 'failed')
+            logger.warning(f"  任务目录不存在，标记为failed: {task_path_str}")
+            return None
+
+        marker_status = self.get_task_status(task_dir)
+        if marker_status == 'success':
+            clear_task_status(task_dir, self.config, statuses=['running', 'failed'])
+            self.db.update_status(task_path_str, 'success')
+            logger.info(f"  跳过已完成任务: {task_path_str}")
+            return None
+
+        if self.worker_mode == 'vasp' and task_type != 'bte_postprocess':
+            self._generate_vasp_inputs(task_dir, task_type=self._vasp_input_type(task_type))
+        self.prepare_task_for_submit(task_dir, task_type=task_type)
+        return task_path_str, task_dir, task_type
+
+    def submit_remote_task_batch(self, task_items: List[Tuple[str, Path, str]]) -> List[Tuple[str, str]]:
+        if self.remote_runner is None or not task_items:
+            return []
+
+        files = []
+        for task_path_str, _task_dir, _task_type in task_items:
+            files.append(task_path_str + "/")
+        try:
+            self.remote_runner.rsync_send_files(files)
+        except Exception as exc:
+            task_paths = [task_path_str for task_path_str, _task_dir, _task_type in task_items]
+            self.db.reset_tasks_to_pending_bulk(task_paths)
+            logger.error(f"远程批量上传失败，{len(task_paths)} 个任务退回 pending: {exc}")
+            return []
+        logger.info(f"远程批量上传 {len(task_items)} 个任务")
+
+        job_mappings = []
+        submit_results = self.remote_runner.submit_tasks(
+            task_path_str for task_path_str, _task_dir, _task_type in task_items
+        )
+        for task_path_str, task_dir, _task_type in task_items:
+            job_id = submit_results.get(task_path_str)
+            if job_id:
+                self.db.update_status(task_path_str, 'running', slurm_job_id=job_id)
+                job_mappings.append((job_id, task_path_str))
+                logger.info(f"  远程提交任务: {task_dir.name} -> job {job_id}")
+            else:
+                self.db.update_status(task_path_str, 'failed')
+        return job_mappings
 
     def _save_job_mapping(self, job_id: str, task_path: Path):
         """保存job_id到任务路径的映射"""
@@ -947,13 +1123,17 @@ class Manager:
 
         logger.info(f"最大并发任务数: {max_workers}")
 
-        # 从队列获取running任务数
+        # running 是已拿到 Slurm job id；submitting 是 manager 已取走但还在准备/上传/提交。
         current_running = self.db.get_running_count()
+        current_submitting = self.db.get_submitting_count()
+        occupied_slots = current_running + current_submitting
 
         logger.info(f"当前运行任务数: {current_running}")
+        if current_submitting:
+            logger.info(f"当前提交中任务数: {current_submitting}")
 
         # 计算还能提交多少任务
-        slots_available = max_workers - current_running
+        slots_available = max_workers - occupied_slots
         if slots_available <= 0:
             logger.info(f"已达到最大并发数限制 ({max_workers})，跳过提交")
             return
@@ -962,39 +1142,28 @@ class Manager:
         submitted = 0
         new_job_mappings = []
 
+        remote_items = []
+
         # 从队列获取pending任务并提交
         while submitted < slots_available:
             task_data = self.db.get_pending_task()
             if task_data is None:
                 break  # 没有pending任务了
 
-            task_path_str = task_data['path']
-            task_dir = self.work_dir / task_path_str
-
-            requires_poscar = task_data.get('task_type') != 'bte_postprocess'
-            if not task_dir.exists() or (requires_poscar and not (task_dir / 'POSCAR').exists()):
-                # 任务目录不存在，标记为failed
-                self.db.update_status(task_path_str, 'failed')
-                logger.warning(f"  任务目录不存在，标记为failed: {task_path_str}")
+            prepared = self._prepare_pending_task(task_data)
+            if prepared is None:
                 continue
 
-            marker_status = self.get_task_status(task_dir)
-            if marker_status == 'success':
-                clear_task_status(task_dir, self.config, statuses=['running', 'failed'])
-                self.db.update_status(task_path_str, 'success')
-                logger.info(f"  跳过已完成任务: {task_path_str}")
-                continue
+            task_path_str, task_dir, task_type = prepared
 
-            # 提交前实时生成VASP输入文件（INCAR/POTCAR/KPOINTS）
-            task_type = task_data.get('task_type', 'opt')
-            vasp_type_map = {
-                'opt': 'opt', 'qha_opt': 'qha_opt', 'phonon': 'phonon',
-                'bte_opt': 'bte_opt', 'bte_fc2': 'phonon', 'bte_fc3': 'phonon',
-                'qha': 'phonon', 'plain': 'plain',
-            }
-            vasp_type = vasp_type_map.get(task_type, 'phonon')
-            if self.worker_mode == 'vasp' and task_type != 'bte_postprocess':
-                self._generate_vasp_inputs(task_dir, task_type=vasp_type)
+            if self.remote_runner is not None:
+                if task_type == 'bte_postprocess':
+                    self.db.update_status(task_path_str, 'failed', error_message='remote mode does not support bte_postprocess tasks')
+                    logger.error(f"远程模式暂不支持 BTE 后处理任务: {task_path_str}")
+                    continue
+                remote_items.append(prepared)
+                submitted += 1
+                continue
 
             # 提交sbatch任务
             job_id = self.submit_sbatch_task(task_dir, task_type=task_type)
@@ -1006,9 +1175,12 @@ class Manager:
                 # 提交失败，标记为failed
                 self.db.update_status(task_path_str, 'failed')
 
+        if remote_items:
+            new_job_mappings.extend(self.submit_remote_task_batch(remote_items))
+
         self._save_job_mappings(new_job_mappings)
         if submitted > 0:
-            logger.info(f"提交了 {submitted} 个新任务 (当前运行: {current_running + submitted}/{max_workers})")
+            logger.info(f"提交了 {submitted} 个新任务 (当前运行: {current_running + len(new_job_mappings)}/{max_workers})")
 
     def sync_running_tasks(self):
         """同步running任务状态（运行中定期调用的快速版本）"""
@@ -2094,10 +2266,11 @@ class Manager:
         logger.info("\n--- 当前任务状态 ---")
         for task_type, counts in stats.items():
             pending = counts.get('pending', 0)
+            submitting = counts.get('submitting', 0)
             running = counts.get('running', 0)
             success = counts.get('success', 0)
             failed = counts.get('failed', 0)
-            logger.info(f"{task_type}: pending={pending}, running={running}, "
+            logger.info(f"{task_type}: pending={pending}, submitting={submitting}, running={running}, "
                   f"success={success}, failed={failed}")
         logger.info("-------------------\n")
 
@@ -2145,14 +2318,17 @@ class Manager:
             # 1. 先同步running任务状态
             self.sync_running_tasks()
 
-            # 2. 同步任务执行时间
-            self.sync_task_times()
-
-            # 3. 任务准备
+            # 2. 任务准备
             self.prepare_tasks_once()
 
-            # 4. 扫描并提交pending任务
+            # 3. 扫描并提交pending任务；finished 已释放槽位，不等结果回传
             self.submit_pending_tasks()
+
+            # 4. 批量回传已结束任务结果；不阻塞前面的补位提交
+            self.sync_finished_tasks_status()
+
+            # 4.5. 同步任务执行时间；放在提交后，避免拖慢补位
+            self.sync_task_times()
 
             # 5. 执行后处理
             if not self.plain_submit:

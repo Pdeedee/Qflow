@@ -126,6 +126,7 @@ def generate_task_script(config: dict, task_name: str = "qflow_task",
     """
     slurm_config = config.get('slurm', {})
     worker_config = config.get('worker', {})
+    remote_mode = config.get('manager', {}).get('mode') == 'remote'
     work_dir = Path(config.get('work_dir', '.')).resolve()
     config_path = work_dir / 'config.yaml'
 
@@ -304,7 +305,7 @@ else
         exit 0
     fi
 
-    if [ -f vasprun.xml ]; then
+    if [ "{str(remote_mode).lower()}" != "true" ] && [ -f vasprun.xml ]; then
         python - <<'PY'
 import sys
 try:

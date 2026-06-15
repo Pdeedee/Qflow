@@ -178,6 +178,8 @@ class TaskDB:
         'timeout': 'failed',
     }
 
+    TRACKED_STATUSES = ('pending', 'submitting', 'running', 'finished', 'success', 'failed')
+
     def __init__(self, config: dict = None, skip_backfill: bool = False):
         if config is None:
             config = load_config()
@@ -614,7 +616,7 @@ class TaskDB:
         return totals
 
     def get_pending_task(self) -> Optional[Dict]:
-        """获取优先级最高的pending任务并标记为running"""
+        """获取优先级最高的pending任务并标记为submitting。"""
         now = datetime.now().isoformat()
 
         with self._get_conn() as conn:
@@ -630,9 +632,9 @@ class TaskDB:
             if row is None:
                 return None
 
-            # 标记为running
+            # 标记为submitting，表示 manager 已取走但尚未拿到 Slurm job id。
             conn.execute('''
-                UPDATE tasks SET status = 'running', updated_at = ?
+                UPDATE tasks SET status = 'submitting', updated_at = ?
                 WHERE id = ?
             ''', (now, row['id']))
             conn.commit()
@@ -716,10 +718,16 @@ class TaskDB:
                 count = row['count']
 
                 if task_type not in stats:
-                    stats[task_type] = {'pending': 0, 'running': 0, 'success': 0, 'failed': 0}
+                    stats[task_type] = {status: 0 for status in self.TRACKED_STATUSES}
                 stats[task_type][status] = count
 
             return stats
+
+    def get_submitting_count(self) -> int:
+        """获取submitting任务数量。"""
+        with self._get_conn() as conn:
+            cursor = conn.execute('SELECT COUNT(*) FROM tasks WHERE status = ?', ('submitting',))
+            return cursor.fetchone()[0]
 
     def get_running_tasks(self) -> List[Dict]:
         """获取所有running任务"""
@@ -735,6 +743,27 @@ class TaskDB:
         with self._get_conn() as conn:
             cursor = conn.execute('SELECT COUNT(*) FROM tasks WHERE status = ?', ('running',))
             return cursor.fetchone()[0]
+
+    def get_finished_tasks(self) -> List[Dict]:
+        """获取远程已结束但尚未回传结果的任务。"""
+        with self._get_conn() as conn:
+            cursor = conn.execute('''
+                SELECT * FROM tasks WHERE status = 'finished'
+                ORDER BY updated_at ASC
+            ''')
+            return [dict(row) for row in cursor]
+
+    def reset_submitting_tasks(self) -> int:
+        """将 manager 中断遗留的 submitting 任务重置为 pending。"""
+        now = datetime.now().isoformat()
+        with self._get_conn() as conn:
+            cursor = conn.execute('''
+                UPDATE tasks
+                SET status = 'pending', updated_at = ?
+                WHERE status = 'submitting'
+            ''', (now,))
+            conn.commit()
+            return cursor.rowcount
 
     def get_tasks(self, status: str = None, task_type: str = None,
                   structure_name: str = None, volume_name: str = None,

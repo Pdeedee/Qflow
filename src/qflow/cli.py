@@ -86,7 +86,7 @@ def _is_manager_running(config=None):
     mode = config.get('manager', {}).get('mode', 'sbatch')
     work_dir = Path(config.get('work_dir', '.')).resolve()
 
-    if mode == 'local':
+    if mode in ('local', 'remote'):
         pid_file = work_dir / 'manager.pid'
         if pid_file.exists():
             try:
@@ -122,7 +122,7 @@ def _cancel_manager(config=None):
     mode = config.get('manager', {}).get('mode', 'sbatch')
     work_dir = Path(config.get('work_dir', '.')).resolve()
 
-    if mode == 'local':
+    if mode in ('local', 'remote'):
         pid_file = work_dir / 'manager.pid'
         if pid_file.exists():
             try:
@@ -182,20 +182,57 @@ def _task_type_to_stage(task_type: str) -> str:
 def _aggregate_statistics(raw_stats):
     """聚合数据库统计到 CLI 展示阶段。"""
     aggregated = {
-        'opt': {'pending': 0, 'running': 0, 'success': 0, 'failed': 0},
-        'phonon': {'pending': 0, 'running': 0, 'success': 0, 'failed': 0},
-        'qha': {'pending': 0, 'running': 0, 'success': 0, 'failed': 0},
-        'bte': {'pending': 0, 'running': 0, 'success': 0, 'failed': 0},
+        'opt': {'pending': 0, 'submitting': 0, 'running': 0, 'finished': 0, 'success': 0, 'failed': 0},
+        'phonon': {'pending': 0, 'submitting': 0, 'running': 0, 'finished': 0, 'success': 0, 'failed': 0},
+        'qha': {'pending': 0, 'submitting': 0, 'running': 0, 'finished': 0, 'success': 0, 'failed': 0},
+        'bte': {'pending': 0, 'submitting': 0, 'running': 0, 'finished': 0, 'success': 0, 'failed': 0},
     }
 
     for task_type, counts in raw_stats.items():
         stage = _task_type_to_stage(task_type)
         if stage not in aggregated:
             continue
-        for status in ('pending', 'running', 'success', 'failed'):
+        for status in ('pending', 'submitting', 'running', 'finished', 'success', 'failed'):
             aggregated[stage][status] += counts.get(status, 0)
 
     return aggregated
+
+
+def _empty_counts():
+    return {'pending': 0, 'submitting': 0, 'running': 0, 'finished': 0, 'success': 0, 'failed': 0}
+
+
+def _query_slurm_states(config):
+    """查询当前配置对应的 Slurm job 状态。remote 模式走远程 SSH。"""
+    manager_mode = config.get('manager', {}).get('mode', 'sbatch')
+    if manager_mode == 'remote':
+        try:
+            from .remote import RemoteRunner
+            runner = RemoteRunner(config)
+            try:
+                ret, out, _err = runner.block_call("squeue -u $USER -o '%.18i %.2t' -h")
+            finally:
+                runner.close()
+            if ret != 0:
+                return {}
+            lines = out.strip().splitlines()
+        except Exception:
+            return {}
+    else:
+        result = subprocess.run(
+            "squeue -u $USER -o '%.18i %.2t' -h",
+            shell=True, capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            return {}
+        lines = result.stdout.strip().splitlines()
+
+    jobid_to_slurm_state = {}
+    for line in lines:
+        parts = line.split()
+        if len(parts) >= 2:
+            jobid_to_slurm_state[parts[0].strip()] = parts[1].strip()
+    return jobid_to_slurm_state
 
 
 def _remove_job_mappings(work_dir: Path, job_ids):
@@ -240,8 +277,8 @@ def cmd_manager(args):
             subs_dir.mkdir(exist_ok=True)
             log_dir.mkdir(exist_ok=True)
 
-            if manager_mode == 'local':
-                # 本地 nohup 模式
+            if manager_mode in ('local', 'remote'):
+                # 本地 nohup 模式；remote 表示本地 manager + 远端任务 executor
                 python_path = sys.executable
                 log_file = log_dir / 'manager.log'
                 pid_file = work_dir / 'manager.pid'
@@ -258,21 +295,24 @@ def cmd_manager(args):
                     except (ProcessLookupError, ValueError):
                         pid_file.unlink()
 
-                # 启动 nohup 进程
-                cmd = f"nohup {python_path} -m qflow.manager > {log_file} 2>&1 & echo $!"
-                result = subprocess.run(
-                    cmd, shell=True, capture_output=True, text=True, cwd=work_dir
-                )
+                # 启动独立 manager 进程，避免 shell 后台启动导致 PID/日志不可靠
+                with open(log_file, "a") as log_fp:
+                    proc = subprocess.Popen(
+                        [python_path, "-m", "qflow.manager"],
+                        cwd=work_dir,
+                        stdout=log_fp,
+                        stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                    )
 
-                if result.returncode == 0:
-                    pid = result.stdout.strip()
-                    pid_file.write_text(pid)
+                if proc.pid:
+                    pid_file.write_text(str(proc.pid))
                     print(f"✓ Manager 已在本地启动 (nohup)")
-                    print(f"  PID: {pid}")
+                    print(f"  PID: {proc.pid}")
                     print(f"  日志: {log_file}")
                     print(f"  停止: qflow manager cancel")
                 else:
-                    print(f"✗ 启动失败: {result.stderr}")
+                    print("✗ 启动失败")
             else:
                 # sbatch 模式（原有逻辑）
                 manager_script = generate_manager_script(config)
@@ -332,16 +372,7 @@ def cmd_status(args):
             path_to_jobid = {v: k for k, v in job_mapping.items()}
 
         # 从 squeue 获取所有 job 的实时状态（使用缩写：PD/R/CG 等）
-        jobid_to_slurm_state = {}
-        result = subprocess.run(
-            "squeue -u $USER -o '%.18i %.2t' -h",
-            shell=True, capture_output=True, text=True
-        )
-        if result.returncode == 0:
-            for line in result.stdout.strip().splitlines():
-                parts = line.split()
-                if len(parts) >= 2:
-                    jobid_to_slurm_state[parts[0].strip()] = parts[1].strip()
+        jobid_to_slurm_state = _query_slurm_states(config)
 
         # 从数据库读取运行时间
         from datetime import datetime
@@ -460,15 +491,15 @@ def cmd_status(args):
     failed_tasks_list = [task['path'] for task in db.get_tasks(status='failed', limit=5)]
 
     if plain_submit:
-        counts = raw_stats.get('plain', {'pending': 0, 'running': 0, 'success': 0, 'failed': 0})
+        counts = raw_stats.get('plain', _empty_counts())
         total = sum(counts.values())
 
         print()
-        print("┌──────────────┬─────────┬─────────┬─────────┬─────────┐")
-        print("│ Plain Tasks  │ Pending │ Running │ Success │ Failed  │")
-        print("├──────────────┼─────────┼─────────┼─────────┼─────────┤")
-        print(f"│ {'Total':<12} │ {counts['pending']:>7} │ {counts['running']:>7} │ {counts['success']:>7} │ {counts['failed']:>7} │")
-        print("└──────────────┴─────────┴─────────┴─────────┴─────────┘")
+        print("┌──────────────┬─────────┬────────────┬─────────┬──────────┬─────────┬─────────┐")
+        print("│ Plain Tasks  │ Pending │ Submitting │ Running │ Finished │ Success │ Failed  │")
+        print("├──────────────┼─────────┼────────────┼─────────┼──────────┼─────────┼─────────┤")
+        print(f"│ {'Total':<12} │ {counts['pending']:>7} │ {counts['submitting']:>10} │ {counts['running']:>7} │ {counts['finished']:>8} │ {counts['success']:>7} │ {counts['failed']:>7} │")
+        print("└──────────────┴─────────┴────────────┴─────────┴──────────┴─────────┴─────────┘")
         print(f"\nTracked plain tasks: {total}")
 
         avg_times = {}
@@ -496,31 +527,39 @@ def cmd_status(args):
         'bte': 'BTE'
     }
 
-    total = {'pending': 0, 'running': 0, 'success': 0, 'failed': 0}
+    total = _empty_counts()
 
     # 收集数据
     rows = []
     for task_type in ['opt', 'phonon', 'qha', 'bte']:
-        counts = stats.get(task_type, {'pending': 0, 'running': 0, 'success': 0, 'failed': 0})
+        counts = stats.get(task_type, _empty_counts())
 
         name = type_names.get(task_type, task_type)
-        rows.append((name, counts['pending'], counts['running'], counts['success'], counts['failed']))
+        rows.append((
+            name,
+            counts['pending'],
+            counts['submitting'],
+            counts['running'],
+            counts['finished'],
+            counts['success'],
+            counts['failed'],
+        ))
 
         for status in total:
             total[status] += counts.get(status, 0)
 
     # 打印表格
     print()
-    print("┌──────────────┬─────────┬─────────┬─────────┬─────────┐")
-    print("│ Stage        │ Pending │ Running │ Success │ Failed  │")
-    print("├──────────────┼─────────┼─────────┼─────────┼─────────┤")
+    print("┌──────────────┬─────────┬────────────┬─────────┬──────────┬─────────┬─────────┐")
+    print("│ Stage        │ Pending │ Submitting │ Running │ Finished │ Success │ Failed  │")
+    print("├──────────────┼─────────┼────────────┼─────────┼──────────┼─────────┼─────────┤")
 
-    for name, pending, running, success, failed in rows:
-        print(f"│ {name:<12} │ {pending:>7} │ {running:>7} │ {success:>7} │ {failed:>7} │")
+    for name, pending, submitting, running, finished, success, failed in rows:
+        print(f"│ {name:<12} │ {pending:>7} │ {submitting:>10} │ {running:>7} │ {finished:>8} │ {success:>7} │ {failed:>7} │")
 
-    print("├──────────────┼─────────┼─────────┼─────────┼─────────┤")
-    print(f"│ {'Total':<12} │ {total['pending']:>7} │ {total['running']:>7} │ {total['success']:>7} │ {total['failed']:>7} │")
-    print("└──────────────┴─────────┴─────────┴─────────┴─────────┘")
+    print("├──────────────┼─────────┼────────────┼─────────┼──────────┼─────────┼─────────┤")
+    print(f"│ {'Total':<12} │ {total['pending']:>7} │ {total['submitting']:>10} │ {total['running']:>7} │ {total['finished']:>8} │ {total['success']:>7} │ {total['failed']:>7} │")
+    print("└──────────────┴─────────┴────────────┴─────────┴──────────┴─────────┴─────────┘")
 
     # 统计虚频结构数量
     structures_dir = (work_dir / config['manager']['structures_dir']).resolve()
@@ -1093,7 +1132,7 @@ def cmd_sync(args):
         db.backfill_workflow_states_from_tasks()
         return db, synced_counts
 
-    if running and manager_mode != 'local':
+    if running and manager_mode not in ('local', 'remote'):
         # 远程 manager 在运行，先停掉再重启，避免远程 manager 和 sync 并发操作数据库
         print(f"检测到运行中的 Manager ({info})")
         print("停止 Manager...")
@@ -1128,7 +1167,7 @@ def cmd_sync(args):
     stats = db.get_statistics()
     print(f"\n当前数据库状态:")
     for task_type, counts in stats.items():
-        print(f"  {task_type}: pending={counts['pending']}, running={counts['running']}, "
+        print(f"  {task_type}: pending={counts['pending']}, submitting={counts.get('submitting', 0)}, running={counts['running']}, "
               f"success={counts['success']}, failed={counts['failed']}")
 
     if not running:
@@ -1195,7 +1234,7 @@ qflow manager run
     print("准备完成。")
     print("\n当前数据库状态:")
     for task_type, counts in stats.items():
-        print(f"  {task_type}: pending={counts['pending']}, running={counts['running']}, "
+        print(f"  {task_type}: pending={counts['pending']}, submitting={counts.get('submitting', 0)}, running={counts['running']}, "
               f"success={counts['success']}, failed={counts['failed']}")
     print("\n提示:")
     print("  qflow status        # 查看阶段进度")
