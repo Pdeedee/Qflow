@@ -699,8 +699,8 @@ def cmd_reset(args):
     running, info = _is_manager_running(config)
     if running:
         mode, _ = _get_manager_mode()
-        if mode == 'local':
-            print(f"注意: Manager正在运行 ({info})，reset将在线执行")
+        if mode in ('local', 'remote'):
+            print(f"注意: Manager正在本地运行 ({info})，reset将在线执行")
         else:
             print(f"错误: Manager正在远程运行 ({info})，请先执行 'qflow cancel' 停止Manager后再reset")
             return

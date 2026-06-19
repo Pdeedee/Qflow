@@ -753,6 +753,21 @@ class TaskDB:
             ''')
             return [dict(row) for row in cursor]
 
+    def get_completed_tasks_missing_time(self) -> List[Dict]:
+        """获取已结束但尚未记录执行时间的任务。"""
+        with self._get_conn() as conn:
+            cursor = conn.execute('''
+                SELECT * FROM tasks
+                WHERE status IN ('success', 'failed')
+                  AND (
+                      start_time IS NULL
+                      OR end_time IS NULL
+                      OR duration_seconds IS NULL
+                  )
+                ORDER BY updated_at ASC
+            ''')
+            return [dict(row) for row in cursor]
+
     def reset_submitting_tasks(self) -> int:
         """将 manager 中断遗留的 submitting 任务重置为 pending。"""
         now = datetime.now().isoformat()

@@ -390,14 +390,13 @@ class Manager:
 
     def sync_task_times(self):
         """同步任务执行时间（仅扫描数据库中已结束的已跟踪任务）"""
-        for status in ('success', 'failed'):
-            for task_data in self.db.get_tasks(status=status):
-                task_dir = self.work_dir / task_data['path']
-                if task_dir.exists():
-                    try:
-                        self._extract_task_time(task_dir, status)
-                    except Exception as exc:
-                        logger.warning(f"任务时间解析失败，跳过 {task_data['path']}: {exc}")
+        for task_data in self.db.get_completed_tasks_missing_time():
+            task_dir = self.work_dir / task_data['path']
+            if task_dir.exists():
+                try:
+                    self._extract_task_time(task_dir, task_data['status'])
+                except Exception as exc:
+                    logger.warning(f"任务时间解析失败，跳过 {task_data['path']}: {exc}")
 
     def _parse_slurm_date(self, date_str: str) -> Optional[str]:
         """Parse common shell date formats from SLURM logs into ISO text."""
@@ -1058,7 +1057,8 @@ class Manager:
                 job_mappings.append((job_id, task_path_str))
                 logger.info(f"  远程提交任务: {task_dir.name} -> job {job_id}")
             else:
-                self.db.update_status(task_path_str, 'failed')
+                self.db.reset_task_to_pending(task_path_str)
+                logger.warning(f"  远程提交失败，任务退回 pending: {task_path_str}")
         return job_mappings
 
     def _save_job_mapping(self, job_id: str, task_path: Path):
@@ -1134,6 +1134,16 @@ class Manager:
 
         # 计算还能提交多少任务
         slots_available = max_workers - occupied_slots
+        if self.remote_runner is not None and slots_available > 0:
+            remote_active_count = self.remote_runner.active_job_count()
+            if remote_active_count is not None:
+                remote_slots_available = max_workers - remote_active_count
+                if remote_slots_available < slots_available:
+                    logger.info(
+                        f"远程账号当前活跃作业数: {remote_active_count}，"
+                        f"按远程上限还可提交 {max(0, remote_slots_available)} 个"
+                    )
+                slots_available = min(slots_available, remote_slots_available)
         if slots_available <= 0:
             logger.info(f"已达到最大并发数限制 ({max_workers})，跳过提交")
             return

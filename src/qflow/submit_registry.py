@@ -154,6 +154,8 @@ class SubmitTaskScanner:
                     progress_callback(scanned, matched)
 
                 if self.is_submit_candidate_name(entry.name, plain_only):
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
                     rel_path = Path(entry.path).relative_to(self.work_dir).as_posix()
                     record = self._classify_submit_candidate(rel_path)
                     if record is not None:

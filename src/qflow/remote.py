@@ -3,6 +3,7 @@
 
 import os
 import shlex
+import socket
 import subprocess
 import tempfile
 import time
@@ -180,11 +181,35 @@ class RemoteRunner:
             self.close()
             self._setup_ssh()
 
+    def _reconnect_ssh(self):
+        self.close()
+        self._setup_ssh()
+
     def block_call(self, cmd: str):
-        self.ensure_alive()
-        stdin, stdout, stderr = self.ssh.exec_command(
-            f"cd {shlex.quote(self.remote_root)} ; " + cmd
+        remote_cmd = f"cd {shlex.quote(self.remote_root)} ; " + cmd
+        connect_errors = (
+            EOFError,
+            OSError,
+            ConnectionError,
+            socket.error,
+            paramiko.SSHException,
         )
+        last_exc = None
+        for attempt in range(1, 4):
+            self.ensure_alive()
+            try:
+                stdin, stdout, stderr = self.ssh.exec_command(remote_cmd)
+                break
+            except connect_errors as exc:
+                last_exc = exc
+                logger.warning(
+                    f"remote command session failed, reconnecting "
+                    f"(attempt {attempt}/3): {type(exc).__name__}: {exc}"
+                )
+                self._reconnect_ssh()
+                time.sleep(attempt)
+        else:
+            raise RuntimeError(f"remote command session failed after reconnects: {cmd}") from last_exc
         exit_status = stdout.channel.recv_exit_status()
         return exit_status, stdout.read().decode("utf-8"), stderr.read().decode("utf-8")
 
@@ -345,3 +370,14 @@ class RemoteRunner:
             logger.warning(f"remote squeue failed, skip running reconcile: {err}")
             return None
         return {job_id for job_id in out.split() if job_id}
+
+    def active_job_count(self) -> Optional[int]:
+        ret, out, err = self.block_call("squeue -u $USER -h -o '%i' | wc -l")
+        if ret != 0:
+            logger.warning(f"remote squeue count failed: {err}")
+            return None
+        try:
+            return int(out.strip() or "0")
+        except ValueError:
+            logger.warning(f"remote squeue count parse failed: {out!r}")
+            return None
