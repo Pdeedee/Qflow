@@ -17,6 +17,54 @@ from phonopy.structure.atoms import PhonopyAtoms
 PREFERRED_PERFECT_TASK_NAME = "task.perfect"
 
 
+def _read_outcar_atoms(outcar_file: Path) -> Atoms:
+    """Read the final ionic image from VASP OUTCAR with ASE."""
+    from ase.io.vasp import read_vasp_out
+
+    return read_vasp_out(str(outcar_file), index=-1)
+
+
+def _outcar_final_electronic_converged(outcar_file: Path) -> Optional[bool]:
+    """Best-effort final electronic convergence check from OUTCAR text."""
+    try:
+        lines = outcar_file.read_text(errors="ignore").splitlines()
+    except OSError:
+        return None
+
+    last_iteration = None
+    for idx, line in enumerate(lines):
+        if "Iteration " in line:
+            last_iteration = idx
+
+    if last_iteration is None:
+        return None
+
+    final_block = "\n".join(lines[last_iteration:])
+    if "aborting loop because EDIFF is reached" in final_block:
+        return True
+    if "reached required accuracy" in final_block:
+        return True
+    if "EDIFF was not reached" in final_block:
+        return False
+    return None
+
+
+def _read_outcar_forces(outcar_file: Path, check_convergence: bool = True) -> np.ndarray:
+    """Read final forces from OUTCAR with ASE."""
+    atoms = _read_outcar_atoms(outcar_file)
+    if check_convergence and _outcar_final_electronic_converged(outcar_file) is False:
+        raise ValueError(
+            f"Unconverged VASP run for force collection: {outcar_file}"
+        )
+    return np.array(atoms.get_forces())
+
+
+def _read_outcar_energy(outcar_file: Path) -> float:
+    """Read final potential energy from OUTCAR with ASE."""
+    atoms = _read_outcar_atoms(outcar_file)
+    return float(atoms.get_potential_energy())
+
+
 def get_perfect_task_dir(parent_dir: Path, create: bool = False) -> Path:
     """Return the perfect-task directory path."""
     return Path(parent_dir) / PREFERRED_PERFECT_TASK_NAME
@@ -316,11 +364,16 @@ def collect_forces(volume_dir: str, use_vasprun: bool = False) -> List[np.ndarra
         if os.path.exists(forces_file):
             forces.append(np.loadtxt(forces_file))
         elif use_vasprun:
+            outcar_file = Path(task_dir) / "OUTCAR"
+            if outcar_file.exists():
+                forces.append(_read_outcar_forces(outcar_file))
+                continue
+
             # 回退到vasprun.xml
             from pymatgen.io.vasp import Vasprun
-            vasprun_file = os.path.join(task_dir, "vasprun.xml")
-            if os.path.exists(vasprun_file):
-                vasprun = Vasprun(vasprun_file, parse_dos=False, parse_eigen=False)
+            vasprun_file = Path(task_dir) / "vasprun.xml"
+            if vasprun_file.exists():
+                vasprun = Vasprun(str(vasprun_file), parse_dos=False, parse_eigen=False)
                 if not vasprun.converged_electronic:
                     raise ValueError(
                         f"Unconverged VASP run for force collection: {vasprun_file}"
@@ -475,6 +528,11 @@ def collect_energies_natoms(struct_dir: str,
         if energy_file.exists():
             energies.append(float(energy_file.read_text().strip()))
         elif use_vasprun:
+            outcar_file = perfect_task_dir / "OUTCAR"
+            if outcar_file.exists():
+                energies.append(_read_outcar_energy(outcar_file))
+                continue
+
             from pymatgen.io.vasp import Vasprun
             vasprun_file = perfect_task_dir / "vasprun.xml"
             if vasprun_file.exists():
@@ -503,9 +561,12 @@ def get_missing_qha_static_energy_volumes(struct_dir: str,
         perfect_task_dir = get_perfect_task_dir(volume_dir)
         energy_file = perfect_task_dir / "energy.txt"
         analyze_energy_file = volume_dir / "analyze" / "energy.txt"
+        outcar_file = perfect_task_dir / "OUTCAR"
         vasprun_file = perfect_task_dir / "vasprun.xml"
 
         if energy_file.exists() or analyze_energy_file.exists():
+            continue
+        if use_vasprun and outcar_file.exists():
             continue
         if use_vasprun and vasprun_file.exists():
             continue
@@ -796,6 +857,11 @@ def collect_bte_forces(bte_dir: str, fc_type: str = 'fc2',
         if forces_file.exists():
             forces.append(np.loadtxt(str(forces_file)))
         elif use_vasprun:
+            outcar_file = task_dir / 'OUTCAR'
+            if outcar_file.exists():
+                forces.append(_read_outcar_forces(outcar_file))
+                continue
+
             vasprun_file = task_dir / 'vasprun.xml'
             if vasprun_file.exists():
                 from pymatgen.io.vasp import Vasprun
