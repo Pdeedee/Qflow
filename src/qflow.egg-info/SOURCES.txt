@@ -6,6 +6,7 @@ src/qflow/logger.py
 src/qflow/manager.py
 src/qflow/phonon_utils.py
 src/qflow/queue_manager.py
+src/qflow/remote.py
 src/qflow/submit_registry.py
 src/qflow/task_db.py
 src/qflow/template.py

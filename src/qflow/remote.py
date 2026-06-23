@@ -3,6 +3,7 @@
 
 import os
 import shlex
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -15,8 +16,16 @@ import paramiko
 from .logger import logger
 
 
-def _run_cmd(cmd: List[str]):
-    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
+def normalize_job_id(job_id: str) -> str:
+    """Normalize Slurm job ids for DB/squeue comparisons."""
+    job_id = str(job_id or "").strip()
+    if not job_id:
+        return ""
+    return job_id.split(".", 1)[0].split("_", 1)[0]
+
+
+def _run_cmd(cmd: List[str], env: Optional[Dict[str, str]] = None):
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env) as proc:
         out, err = proc.communicate()
         return proc.returncode, out, err
 
@@ -26,6 +35,7 @@ def rsync(
     to_path: str,
     port: int = 22,
     key_filename: Optional[str] = None,
+    password: Optional[str] = None,
     timeout: int = 20,
     option_args: Optional[List[str]] = None,
     additional_args: Optional[List[str]] = None,
@@ -33,22 +43,32 @@ def rsync(
     ssh_cmd = [
         "ssh",
         "-o", f"ConnectTimeout={timeout}",
-        "-o", "BatchMode=yes",
         "-o", "StrictHostKeyChecking=no",
         "-p", str(port),
         "-q",
     ]
+    if password:
+        ssh_cmd.extend(["-o", "BatchMode=no"])
+    else:
+        ssh_cmd.extend(["-o", "BatchMode=yes"])
     if key_filename:
         ssh_cmd.extend(["-i", key_filename])
 
     cmd = ["rsync", "-az", "-e", " ".join(ssh_cmd), "-q"]
+    env = None
+    if password:
+        if shutil.which("sshpass") is None:
+            raise RuntimeError("rsync password login requires sshpass in PATH")
+        cmd = ["sshpass", "-e"] + cmd
+        env = os.environ.copy()
+        env["SSHPASS"] = password
     if option_args:
         cmd.extend(option_args)
     cmd.extend([from_path, to_path])
     if additional_args:
         cmd.extend(additional_args)
 
-    ret, out, err = _run_cmd(cmd)
+    ret, out, err = _run_cmd(cmd, env=env)
     if ret != 0:
         raise RuntimeError(f"rsync failed: {' '.join(cmd)}\n{err.decode('utf-8', errors='replace')}")
 
@@ -67,7 +87,11 @@ class RemoteRunner:
         self.remote_root = str(self.remote_config.get("remote_root", "")).rstrip("/")
         self.project_name = self.remote_config.get("project_name") or self.work_dir.name
         self.remote_work_dir = f"{self.remote_root}/{self.project_name}".rstrip("/")
+        self.rclone_remote = str(self.remote_config.get("rclone_remote") or "").rstrip(":")
         self.key_filename = self.remote_config.get("ssh_key_filename")
+        self.password = self._resolve_password()
+        self._rsync_key_filename = self.key_filename
+        self._use_sftp_transfer = False
         self.ssh = None
         self._sftp = None
         self.remotename = f"{self.username}@{self.hostname}"
@@ -77,14 +101,28 @@ class RemoteRunner:
 
         self._setup_ssh()
 
+    def _resolve_password(self) -> Optional[str]:
+        password = self.remote_config.get("ssh_password")
+        if password:
+            return str(password)
+
+        password_env = self.remote_config.get("ssh_password_env")
+        if password_env:
+            return os.environ.get(str(password_env))
+
+        return None
+
     def _setup_ssh(self):
-        key_candidates = self._ssh_key_candidates()
+        key_candidates = [] if self.password and not self.key_filename else self._ssh_key_candidates()
+        if self.password:
+            key_candidates.append(None)
         if not key_candidates:
             key_candidates = [None]
 
         errors = []
         for key_filename in key_candidates:
-            key_msg = key_filename or "default SSH keys"
+            use_password = key_filename is None and self.password is not None
+            key_msg = "password" if use_password else (key_filename or "default SSH keys")
             for attempt in range(1, 4):
                 self.ssh = paramiko.SSHClient()
                 self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -98,10 +136,11 @@ class RemoteRunner:
                         port=self.port,
                         username=self.username,
                         key_filename=key_filename,
+                        password=self.password if use_password else None,
                         timeout=self.timeout,
                         compress=True,
                         allow_agent=False,
-                        look_for_keys=key_filename is None,
+                        look_for_keys=(key_filename is None and not use_password),
                     )
                 except Exception as exc:
                     errors.append(f"{key_msg}: {type(exc).__name__}: {exc!r}")
@@ -110,6 +149,8 @@ class RemoteRunner:
                     time.sleep(2)
                     continue
                 self.key_filename = key_filename
+                self._rsync_key_filename = None if use_password else key_filename
+                self._use_sftp_transfer = use_password and shutil.which("sshpass") is None
                 logger.info("remote ssh connection established")
                 return
 
@@ -222,11 +263,123 @@ class RemoteRunner:
     def remote_task_path(self, task_path: str) -> str:
         return f"{self.remote_work_dir}/{task_path}"
 
+    def _rclone_target(self, path: str = "") -> str:
+        path = str(path).strip("/")
+        suffix = f"/{path}" if path else ""
+        return f"{self.rclone_remote}:{self.remote_work_dir}{suffix}"
+
+    def _use_rclone(self) -> bool:
+        return bool(self.rclone_remote and shutil.which("rclone"))
+
+    def _rclone_copy_files(self, files: Iterable[str]):
+        files = [str(path).rstrip("/") for path in files]
+        if not files:
+            return
+        with tempfile.NamedTemporaryFile("w", delete=False) as fp:
+            files_from = fp.name
+            for path in files:
+                fp.write(path + "\n")
+        try:
+            cmd = [
+                "rclone", "copy",
+                str(self.work_dir),
+                self._rclone_target(),
+                "--files-from", files_from,
+                "--create-empty-src-dirs",
+                "--transfers", str(self.remote_config.get("rclone_transfers", 16)),
+                "--checkers", str(self.remote_config.get("rclone_checkers", 32)),
+                "--fast-list",
+                "--copy-links",
+            ]
+            ret, _out, err = _run_cmd(cmd)
+            if ret != 0:
+                raise RuntimeError(f"rclone upload failed: {' '.join(cmd)}\n{err.decode('utf-8', errors='replace')}")
+        finally:
+            try:
+                os.remove(files_from)
+            except OSError:
+                pass
+
+    def _rclone_fetch_dirs(self, task_paths: Iterable[str]):
+        for task_path in task_paths:
+            task_path = str(task_path).strip("/")
+            if not task_path:
+                continue
+            local_path = self.work_dir / task_path
+            local_path.mkdir(parents=True, exist_ok=True)
+            cmd = [
+                "rclone", "copy",
+                self._rclone_target(task_path),
+                str(local_path),
+                "--exclude", "POTCAR",
+                "--exclude", "*.xml",
+                "--transfers", str(self.remote_config.get("rclone_transfers", 16)),
+                "--checkers", str(self.remote_config.get("rclone_checkers", 32)),
+                "--fast-list",
+            ]
+            ret, _out, err = _run_cmd(cmd)
+            if ret != 0:
+                raise RuntimeError(f"rclone fetch failed: {' '.join(cmd)}\n{err.decode('utf-8', errors='replace')}")
+
+    def _get_sftp(self):
+        self.ensure_alive()
+        if self._sftp is None:
+            self._sftp = self.ssh.open_sftp()
+        return self._sftp
+
+    def _sftp_mkdir_p(self, remote_dir: str):
+        sftp = self._get_sftp()
+        parts = []
+        current = str(remote_dir).strip("/")
+        while current:
+            parts.append(current)
+            current = str(Path(current).parent)
+            if current == ".":
+                break
+        for part in reversed(parts):
+            path = "/" + part
+            try:
+                sftp.stat(path)
+            except FileNotFoundError:
+                sftp.mkdir(path)
+
+    def _sftp_put_files(self, files: Iterable[str]):
+        sftp = self._get_sftp()
+        self._sftp_mkdir_p(self.remote_work_dir)
+        for rel_path in files:
+            local_path = self.work_dir / rel_path
+            if not local_path.is_file():
+                continue
+            remote_path = f"{self.remote_work_dir}/{rel_path}"
+            self._sftp_mkdir_p(str(Path(remote_path).parent))
+            sftp.put(str(local_path), remote_path)
+
+    def _sftp_fetch_dir(self, remote_dir: str, local_dir: Path):
+        sftp = self._get_sftp()
+        local_dir.mkdir(parents=True, exist_ok=True)
+        for item in sftp.listdir_attr(remote_dir):
+            name = item.filename
+            if name == "POTCAR" or name.endswith(".xml"):
+                continue
+            remote_path = f"{remote_dir.rstrip('/')}/{name}"
+            local_path = local_dir / name
+            if item.st_mode & 0o040000:
+                self._sftp_fetch_dir(remote_path, local_path)
+            else:
+                local_path.parent.mkdir(parents=True, exist_ok=True)
+                sftp.get(remote_path, str(local_path))
+
     def rsync_send_files(self, files: Iterable[str]):
         files = self._expand_files_from(files)
         if not files:
             return
         self.block_checkcall(f"mkdir -p {shlex.quote(self.remote_work_dir)}")
+        if self._use_rclone():
+            self._rclone_copy_files(files)
+            return
+        if self._use_sftp_transfer:
+            self._sftp_put_files(files)
+            return
         with tempfile.NamedTemporaryFile("w", delete=False) as fp:
             files_from = fp.name
             for path in files:
@@ -236,7 +389,8 @@ class RemoteRunner:
                 str(self.work_dir) + "/",
                 f"{self.remotename}:{self.remote_work_dir}/",
                 port=self.port,
-                key_filename=self.key_filename,
+                key_filename=self._rsync_key_filename,
+                password=self.password,
                 timeout=self.timeout,
                 option_args=[f"--files-from={files_from}"],
             )
@@ -265,11 +419,18 @@ class RemoteRunner:
         local_path = self.work_dir / task_path
         local_path.mkdir(parents=True, exist_ok=True)
         remote_path = self.remote_task_path(task_path).rstrip("/") + "/"
+        if self._use_rclone():
+            self._rclone_fetch_dirs([task_path])
+            return
+        if self._use_sftp_transfer:
+            self._sftp_fetch_dir(remote_path.rstrip("/"), local_path)
+            return
         rsync(
             f"{self.remotename}:{remote_path}",
             str(local_path) + "/",
             port=self.port,
-            key_filename=self.key_filename,
+            key_filename=self._rsync_key_filename,
+            password=self.password,
             timeout=self.timeout,
             additional_args=["--exclude=POTCAR", "--exclude=*.xml"],
         )
@@ -277,6 +438,13 @@ class RemoteRunner:
     def rsync_fetch_tasks(self, task_paths: Iterable[str]):
         task_paths = [str(path).rstrip("/") for path in task_paths]
         if not task_paths:
+            return
+        if self._use_rclone():
+            self._rclone_fetch_dirs(task_paths)
+            return
+        if self._use_sftp_transfer:
+            for task_path in task_paths:
+                self.rsync_fetch_task(task_path)
             return
 
         with tempfile.NamedTemporaryFile("w", delete=False) as fp:
@@ -289,7 +457,8 @@ class RemoteRunner:
                 f"{self.remotename}:{self.remote_work_dir}/",
                 str(self.work_dir) + "/",
                 port=self.port,
-                key_filename=self.key_filename,
+                key_filename=self._rsync_key_filename,
+                password=self.password,
                 timeout=self.timeout,
                 option_args=[f"--files-from={files_from}", "--relative"],
                 additional_args=["--exclude=POTCAR", "--exclude=*.xml"],
@@ -330,12 +499,13 @@ class RemoteRunner:
         ]
         for task_path in task_paths:
             quoted_task = shlex.quote(task_path)
-            lines.append(f"out=$(cd {quoted_task} && sbatch run.sbatch 2>&1)")
+            lines.append(f"out=$((cd {quoted_task} && sbatch run.sbatch) 2>&1)")
             lines.append("ret=$?")
             lines.append(
                 "if [ $ret -eq 0 ]; then "
                 f"printf 'QFLOW_SUBMIT_OK\\t%s\\t%s\\n' {shlex.quote(task_path)} \"${{out##* }}\"; "
                 "else "
+                "[ -n \"$out\" ] || out=\"exit_code=$ret with no output\"; "
                 f"printf 'QFLOW_SUBMIT_FAIL\\t%s\\t%s\\n' {shlex.quote(task_path)} \"$out\"; "
                 "fi"
             )
@@ -354,22 +524,48 @@ class RemoteRunner:
                 results[task_path] = value.strip()
             elif tag == "QFLOW_SUBMIT_FAIL":
                 logger.error(f"remote sbatch failed for {task_path}: {value}")
+                error_path = self.work_dir / task_path / "remote_submit_error.log"
+                error_path.parent.mkdir(parents=True, exist_ok=True)
+                error_path.write_text(value + "\n")
                 results[task_path] = None
         for task_path in task_paths:
             results.setdefault(task_path, None)
         return results
 
     def active_job_ids(self, job_ids: Iterable[str]) -> Optional[set]:
-        normalized = sorted({str(job_id).strip() for job_id in job_ids if str(job_id).strip()})
+        normalized = sorted({normalize_job_id(job_id) for job_id in job_ids if normalize_job_id(job_id)})
         if not normalized:
             return set()
         ret, out, err = self.block_call("squeue -h -o '%i' -j " + ",".join(normalized))
         if ret != 0:
             if "Invalid job id specified" in err:
-                return set()
+                active_ids = set()
+                for job_id in normalized:
+                    single_ret, single_out, single_err = self.block_call(
+                        "squeue -h -o '%i' -j " + shlex.quote(job_id)
+                    )
+                    if single_ret == 0:
+                        active_ids.update(
+                            normalize_job_id(item)
+                            for item in single_out.split()
+                            if normalize_job_id(item)
+                        )
+                    elif "Invalid job id specified" not in single_err:
+                        logger.warning(f"remote squeue failed for job {job_id}: {single_err}")
+                        return None
+                return active_ids
             logger.warning(f"remote squeue failed, skip running reconcile: {err}")
             return None
-        return {job_id for job_id in out.split() if job_id}
+        return {normalize_job_id(job_id) for job_id in out.split() if normalize_job_id(job_id)}
+
+    def cancel_jobs(self, job_ids: Iterable[str]) -> int:
+        normalized = sorted({normalize_job_id(job_id) for job_id in job_ids if normalize_job_id(job_id)})
+        if not normalized:
+            return 0
+        ret, _out, err = self.block_call("scancel " + " ".join(shlex.quote(job_id) for job_id in normalized))
+        if ret != 0:
+            raise RuntimeError(f"remote scancel failed: {err}")
+        return len(normalized)
 
     def active_job_count(self) -> Optional[int]:
         ret, out, err = self.block_call("squeue -u $USER -h -o '%i' | wc -l")

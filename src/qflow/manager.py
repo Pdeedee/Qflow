@@ -25,7 +25,7 @@ from .utils import (
 from .template import generate_task_script
 from .task_db import TaskDB, ImaginaryFrequencyDB
 from .submit_registry import SubmitTaskScanner
-from .remote import RemoteRunner
+from .remote import RemoteRunner, normalize_job_id
 from .phonon_utils import (
     generate_phonon_displacements,
     postprocess_phonon,
@@ -127,7 +127,11 @@ class Manager:
         if reset_count:
             logger.info(f"重置 {reset_count} 个未完成提交的任务为 pending")
         self.imaginary_db = ImaginaryFrequencyDB(config)
-        self.submit_scanner = SubmitTaskScanner(self.work_dir, self.structures_dir)
+        self.submit_scanner = SubmitTaskScanner(
+            self.work_dir,
+            self.structures_dir,
+            follow_symlinks=bool(manager_config.get('follow_symlinks', False)),
+        )
         self.remote_runner = RemoteRunner(config) if self.manager_mode == 'remote' else None
         self._backfill_workflow_state_from_markers()
 
@@ -151,6 +155,39 @@ class Manager:
         if (task_path / 'POSCAR').exists():
             return 'pending'
         return 'not_ready'
+
+    @staticmethod
+    def _task_requires_poscar(task_type: str) -> bool:
+        """Whether a tracked task is a structure calculation with POSCAR input."""
+        return task_type != 'bte_postprocess'
+
+    def _task_dir_is_ready(self, task_dir: Path, task_type: str) -> bool:
+        """Check the minimal local files required before tracking/submitting a task."""
+        if not task_dir.exists():
+            return False
+        if self._task_requires_poscar(task_type) and not (task_dir / 'POSCAR').exists():
+            return False
+        return True
+
+    def _remote_upload_paths_for_task(self, task_path_str: str, task_type: str) -> List[str]:
+        """Return relative paths that must be uploaded before remote submission."""
+        if task_type == 'bte_postprocess':
+            task_path = Path(task_path_str)
+            # bte/analyze/task.BTE needs sibling fc2/fc3 force outputs and analyze inputs.
+            return [task_path.parent.parent.as_posix() + "/"]
+        return [task_path_str.rstrip("/") + "/"]
+
+    def _remote_fetch_path_for_task(self, task_path_str: str, task_type: str) -> str:
+        """Return the relative path to fetch when a remote task finishes."""
+        if task_type == 'bte_postprocess':
+            return Path(task_path_str).parent.as_posix()
+        return task_path_str.rstrip("/")
+
+    def _remote_cleanup_path_for_task(self, task_path_str: str, task_type: str) -> str:
+        """Return the remote path to remove after results have been fetched."""
+        if task_type == 'bte_postprocess':
+            return Path(task_path_str).parent.parent.as_posix()
+        return task_path_str.rstrip("/")
 
     def _iter_submit_task_dirs(self, parent_dir: Path) -> List[Path]:
         """返回应被注册/提交的任务目录。"""
@@ -182,7 +219,7 @@ class Manager:
 
         normalized_job_ids = None
         if job_ids is not None:
-            normalized_job_ids = sorted({str(job_id).strip() for job_id in job_ids if str(job_id).strip()})
+            normalized_job_ids = sorted({normalize_job_id(job_id) for job_id in job_ids if normalize_job_id(job_id)})
             if not normalized_job_ids:
                 return set()
 
@@ -215,7 +252,7 @@ class Manager:
             else:
                 logger.warning(f"查询 squeue 失败，跳过 running 状态校正: {query_scope}")
             return None
-        return {job_id for job_id in result.stdout.strip().split() if job_id}
+        return {normalize_job_id(job_id) for job_id in result.stdout.strip().split() if normalize_job_id(job_id)}
 
     def _sync_remote_finished_task(self, task_path_str: str):
         if self.remote_runner is None:
@@ -228,15 +265,37 @@ class Manager:
     def _sync_remote_finished_tasks(self, task_path_strs: List[str]):
         if self.remote_runner is None or not task_path_strs:
             return
+        task_records = {
+            task_data['path']: task_data
+            for task_data in self.db.get_finished_tasks()
+            if task_data['path'] in task_path_strs
+        }
+        fetch_paths = [
+            self._remote_fetch_path_for_task(
+                task_path_str,
+                task_records.get(task_path_str, {}).get('task_type', ''),
+            )
+            for task_path_str in task_path_strs
+        ]
+        cleanup_paths = [
+            self._remote_cleanup_path_for_task(
+                task_path_str,
+                task_records.get(task_path_str, {}).get('task_type', ''),
+            )
+            for task_path_str in task_path_strs
+        ]
         try:
-            self.remote_runner.rsync_fetch_tasks(task_path_strs)
+            self.remote_runner.rsync_fetch_tasks(fetch_paths)
             logger.info(f"批量下载 {len(task_path_strs)} 个远程任务结果")
-            self.remote_runner.remove_remote_tasks(task_path_strs)
+            self.remote_runner.remove_remote_tasks(cleanup_paths)
             logger.info(f"清理 {len(task_path_strs)} 个远程任务目录")
         except Exception as exc:
             logger.warning(f"远程批量结果下载失败，改为逐个下载: {exc}")
             for task_path_str in task_path_strs:
-                self._sync_remote_finished_task(task_path_str)
+                task_type = task_records.get(task_path_str, {}).get('task_type', '')
+                self._sync_remote_finished_task(
+                    self._remote_fetch_path_for_task(task_path_str, task_type)
+                )
 
     def _task_relpath(self, task_path: Path) -> str:
         """获取相对 work_dir 的任务路径。"""
@@ -628,6 +687,8 @@ class Manager:
         for record in records:
             task_path = record['path']
             task_dir = self.work_dir / task_path
+            if not self._task_dir_is_ready(task_dir, record.get('task_type', '')):
+                continue
             status = self.get_task_status(task_dir)
             if status == 'success':
                 self.db.update_status(task_path, status)
@@ -721,11 +782,12 @@ class Manager:
         for task_data in self.db.get_tasks():
             task_path_str = task_data['path']
             task_dir = self.work_dir / task_path_str
+            task_type = task_data.get('task_type', '')
 
             if task_data['status'] == 'running':
                 continue
 
-            if not task_dir.exists() or not (task_dir / 'POSCAR').exists():
+            if not self._task_dir_is_ready(task_dir, task_type):
                 if self.db.remove_task(task_path_str):
                     recovered['removed'] += 1
                 continue
@@ -757,18 +819,46 @@ class Manager:
         }
         running_tasks = self.db.get_running_tasks()
         running_job_ids = [task_data.get('slurm_job_id') for task_data in running_tasks if task_data.get('slurm_job_id')]
-        active_jobs = self._get_active_slurm_jobs(running_job_ids)
+        mapped_jobs = {}
+        if self.jobs_file.exists():
+            try:
+                mapped_jobs = json.loads(self.jobs_file.read_text())
+            except json.JSONDecodeError:
+                logger.warning(f"任务 job 映射文件损坏，跳过映射恢复: {self.jobs_file}")
+
+        mapped_job_ids = list(mapped_jobs)
+        active_jobs = self._get_active_slurm_jobs(running_job_ids + mapped_job_ids)
         status_updates = []
         pending_paths = []
         stale_job_ids = []
         finished_count = 0
 
+        if active_jobs is not None and mapped_jobs:
+            running_paths = {task_data['path'] for task_data in running_tasks}
+            for mapped_job_id, mapped_task_path in mapped_jobs.items():
+                normalized_job_id = normalize_job_id(mapped_job_id)
+                if not normalized_job_id:
+                    stale_job_ids.append(mapped_job_id)
+                    continue
+                task_data = self.db.get_task(mapped_task_path)
+                if not task_data:
+                    stale_job_ids.append(mapped_job_id)
+                    continue
+                if normalized_job_id in active_jobs:
+                    if mapped_task_path not in running_paths:
+                        self.db.update_status(mapped_task_path, 'running', slurm_job_id=mapped_job_id)
+                        running_paths.add(mapped_task_path)
+                        logger.info(f"从 job 映射恢复远程运行任务: {mapped_task_path} -> job {mapped_job_id}")
+                elif task_data.get('status') != 'running':
+                    stale_job_ids.append(mapped_job_id)
+
         for task_data in running_tasks:
             task_path_str = task_data['path']
             task_dir = self.work_dir / task_path_str
+            task_type = task_data.get('task_type', '')
             slurm_job_id = task_data.get('slurm_job_id')
 
-            if not task_dir.exists() or not (task_dir / 'POSCAR').exists():
+            if not self._task_dir_is_ready(task_dir, task_type):
                 status_updates.append((task_path_str, 'failed'))
                 stale_job_ids.append(slurm_job_id)
                 recovered['failed'] += 1
@@ -784,7 +874,7 @@ class Manager:
                 pending_paths.append(task_path_str)
                 stale_job_ids.append(slurm_job_id)
                 recovered['pending'] += 1
-            elif active_jobs is not None and slurm_job_id not in active_jobs:
+            elif active_jobs is not None and normalize_job_id(slurm_job_id) not in active_jobs:
                 clear_task_status(task_dir, self.config, statuses=['running'])
                 status_updates.append((task_path_str, 'finished'))
                 stale_job_ids.append(slurm_job_id)
@@ -870,9 +960,10 @@ class Manager:
         for task_data in running_tasks:
             task_path_str = task_data['path']
             task_path = self.work_dir / task_path_str
+            task_type = task_data.get('task_type', '')
             slurm_job_id = task_data.get('slurm_job_id', '')
 
-            if not task_path.exists() or not (task_path / 'POSCAR').exists():
+            if not self._task_dir_is_ready(task_path, task_type):
                 status_updates.append((task_path_str, 'failed'))
                 stale_job_ids.append(slurm_job_id)
                 reset_to_failed += 1
@@ -888,7 +979,7 @@ class Manager:
                 stale_job_ids.append(slurm_job_id)
                 reset_to_pending += 1
                 logger.warning(f"任务 {task_path_str} 缺少 slurm_job_id，重置为pending")
-            elif active_jobs is not None and slurm_job_id not in active_jobs:
+            elif active_jobs is not None and normalize_job_id(slurm_job_id) not in active_jobs:
                 clear_task_status(task_path, self.config, statuses=['running'])
                 status_updates.append((task_path_str, 'finished'))
                 stale_job_ids.append(slurm_job_id)
@@ -1012,8 +1103,7 @@ class Manager:
         task_dir = self.work_dir / task_path_str
         task_type = task_data.get('task_type', 'opt')
 
-        requires_poscar = task_type != 'bte_postprocess'
-        if not task_dir.exists() or (requires_poscar and not (task_dir / 'POSCAR').exists()):
+        if not self._task_dir_is_ready(task_dir, task_type):
             self.db.update_status(task_path_str, 'failed')
             logger.warning(f"  任务目录不存在，标记为failed: {task_path_str}")
             return None
@@ -1036,7 +1126,8 @@ class Manager:
 
         files = []
         for task_path_str, _task_dir, _task_type in task_items:
-            files.append(task_path_str + "/")
+            files.extend(self._remote_upload_paths_for_task(task_path_str, _task_type))
+        files = list(dict.fromkeys(files))
         try:
             self.remote_runner.rsync_send_files(files)
         except Exception as exc:
@@ -1100,14 +1191,14 @@ class Manager:
         if not job_ids or not self.jobs_file.exists():
             return
 
-        stale_ids = {job_id for job_id in job_ids if job_id}
+        stale_ids = {normalize_job_id(job_id) for job_id in job_ids if normalize_job_id(job_id)}
         if not stale_ids:
             return
 
         jobs = json.loads(self.jobs_file.read_text())
         changed = False
-        for job_id in stale_ids:
-            if job_id in jobs:
+        for job_id in list(jobs):
+            if normalize_job_id(job_id) in stale_ids:
                 del jobs[job_id]
                 changed = True
 
@@ -1134,16 +1225,6 @@ class Manager:
 
         # 计算还能提交多少任务
         slots_available = max_workers - occupied_slots
-        if self.remote_runner is not None and slots_available > 0:
-            remote_active_count = self.remote_runner.active_job_count()
-            if remote_active_count is not None:
-                remote_slots_available = max_workers - remote_active_count
-                if remote_slots_available < slots_available:
-                    logger.info(
-                        f"远程账号当前活跃作业数: {remote_active_count}，"
-                        f"按远程上限还可提交 {max(0, remote_slots_available)} 个"
-                    )
-                slots_available = min(slots_available, remote_slots_available)
         if slots_available <= 0:
             logger.info(f"已达到最大并发数限制 ({max_workers})，跳过提交")
             return
@@ -1167,10 +1248,6 @@ class Manager:
             task_path_str, task_dir, task_type = prepared
 
             if self.remote_runner is not None:
-                if task_type == 'bte_postprocess':
-                    self.db.update_status(task_path_str, 'failed', error_message='remote mode does not support bte_postprocess tasks')
-                    logger.error(f"远程模式暂不支持 BTE 后处理任务: {task_path_str}")
-                    continue
                 remote_items.append(prepared)
                 submitted += 1
                 continue

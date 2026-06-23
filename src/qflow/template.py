@@ -3,6 +3,7 @@
 
 import sys
 import os
+import pprint
 from pathlib import Path
 
 
@@ -128,7 +129,7 @@ def generate_task_script(config: dict, task_name: str = "qflow_task",
     worker_config = config.get('worker', {})
     remote_mode = config.get('manager', {}).get('mode') == 'remote'
     work_dir = Path(config.get('work_dir', '.')).resolve()
-    config_path = work_dir / 'config.yaml'
+    config_literal = pprint.pformat(config, width=120, sort_dicts=False)
 
     # 获取基本配置
     nodes = slurm_config.get('nodes', 1)
@@ -194,9 +195,8 @@ timeout {timeout} {python_path} - <<'PY' > {task_log} 2>&1
 from pathlib import Path
 
 from qflow.phonon_utils import postprocess_bte
-from qflow.utils import load_config
 
-config = load_config({str(config_path)!r})
+config = {config_literal}
 task_dir = Path.cwd()
 bte_dir = task_dir.parent.parent
 bte_cfg = config.get('bte', {{}})

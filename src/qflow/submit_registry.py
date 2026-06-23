@@ -9,9 +9,10 @@ from typing import Callable, Dict, Iterable, List, Optional
 class SubmitTaskScanner:
     """快速扫描可提交目录并提取任务元数据。"""
 
-    def __init__(self, work_dir: Path, structures_dir: Path):
+    def __init__(self, work_dir: Path, structures_dir: Path, follow_symlinks: bool = False):
         self.work_dir = Path(work_dir).resolve()
         self.structures_dir = Path(structures_dir).resolve()
+        self.follow_symlinks = follow_symlinks
 
         structures_relpath = self.structures_dir.relative_to(self.work_dir).as_posix()
         base = rf"^{re.escape(structures_relpath)}/(?P<structure_name>[^/]+)"
@@ -144,26 +145,34 @@ class SubmitTaskScanner:
             return
 
         scan_stack = [self.structures_dir]
+        visited_dirs = set()
         scanned = 0
         matched = 0
         while scan_stack:
             current_dir = scan_stack.pop()
+            if self.follow_symlinks and current_dir.is_symlink():
+                real_dir = current_dir.resolve()
+                if real_dir in visited_dirs:
+                    continue
+                visited_dirs.add(real_dir)
             for entry in os.scandir(current_dir):
                 scanned += 1
                 if progress_callback is not None and scanned % progress_every == 0:
                     progress_callback(scanned, matched)
 
                 if self.is_submit_candidate_name(entry.name, plain_only):
-                    if not entry.is_dir(follow_symlinks=False):
+                    if not entry.is_dir(follow_symlinks=self.follow_symlinks):
                         continue
                     rel_path = Path(entry.path).relative_to(self.work_dir).as_posix()
                     record = self._classify_submit_candidate(rel_path)
                     if record is not None:
+                        if record['task_type'] != 'bte_postprocess' and not (Path(entry.path) / 'POSCAR').exists():
+                            continue
                         matched += 1
                         yield record
                     continue
 
-                if entry.is_dir(follow_symlinks=False):
+                if entry.is_dir(follow_symlinks=self.follow_symlinks):
                     scan_stack.append(Path(entry.path))
 
     def scan(self, plain_only: bool = False) -> List[Dict]:

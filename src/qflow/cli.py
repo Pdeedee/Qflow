@@ -12,6 +12,7 @@ from pathlib import Path
 
 from .utils import load_config, clear_task_status
 from .template import generate_manager_script
+from .remote import normalize_job_id
 
 
 def cmd_worker(args):
@@ -231,7 +232,9 @@ def _query_slurm_states(config):
     for line in lines:
         parts = line.split()
         if len(parts) >= 2:
-            jobid_to_slurm_state[parts[0].strip()] = parts[1].strip()
+            job_id = normalize_job_id(parts[0])
+            if job_id:
+                jobid_to_slurm_state[job_id] = parts[1].strip()
     return jobid_to_slurm_state
 
 
@@ -244,8 +247,9 @@ def _remove_job_mappings(work_dir: Path, job_ids):
     job_mapping = json.loads(jobs_file.read_text())
 
     updated = False
-    for job_id in job_ids:
-        if job_id and job_id in job_mapping:
+    stale_ids = {normalize_job_id(job_id) for job_id in job_ids if normalize_job_id(job_id)}
+    for job_id in list(job_mapping):
+        if normalize_job_id(job_id) in stale_ids:
             del job_mapping[job_id]
             updated = True
 
@@ -451,7 +455,7 @@ def cmd_status(args):
             task_path = task_data['path']
             raw_task_type = task_data.get('task_type', 'unknown')
             job_id = task_data.get('slurm_job_id') or path_to_jobid.get(task_path, '-')
-            slurm_state = jobid_to_slurm_state.get(job_id, '-')
+            slurm_state = jobid_to_slurm_state.get(normalize_job_id(job_id), '-')
             updated_at_str = task_data.get('updated_at')
             elapsed_min = 0
             if updated_at_str:
@@ -620,6 +624,7 @@ def cmd_cancel(args):
     cancelled = 0
     config = load_config()
     work_dir = Path(config.get('work_dir', '.')).resolve()
+    manager_mode = config.get('manager', {}).get('mode', 'sbatch')
     jobs_file = work_dir / 'sbatch_jobs.json'
     from .task_db import TaskDB
     db = TaskDB(config, skip_backfill=True)
@@ -640,27 +645,48 @@ def cmd_cancel(args):
         if task_data.get('slurm_job_id')
     ]
 
+    candidate_job_ids = set(running_job_ids) | set(job_mapping)
     task_job_ids = []
     if running_job_ids or job_mapping:
-        result = subprocess.run(
-            "squeue -u $USER -o '%.18i' -h",
-            shell=True,
-            capture_output=True,
-            text=True
-        )
-
-        if result.returncode == 0:
-            active_job_ids = set(result.stdout.strip().split())
-            candidate_job_ids = set(running_job_ids) | set(job_mapping)
-            task_job_ids = [job_id for job_id in candidate_job_ids if job_id in active_job_ids]
-
-        if task_job_ids:
-            print(f"找到当前 manager 提交的 {len(task_job_ids)} 个任务作业")
-            for job_id in task_job_ids:
-                subprocess.run(f"scancel {job_id}", shell=True)
-                cancelled += 1
-            print(f"  已取消 {len(task_job_ids)} 个任务作业")
+        if manager_mode == 'remote':
+            try:
+                from .remote import RemoteRunner, normalize_job_id
+                runner = RemoteRunner(config)
+                try:
+                    active_job_ids = runner.active_job_ids(candidate_job_ids)
+                    if active_job_ids is None:
+                        active_job_ids = {normalize_job_id(job_id) for job_id in candidate_job_ids if normalize_job_id(job_id)}
+                    task_job_ids = sorted(
+                        {normalize_job_id(job_id) for job_id in candidate_job_ids}
+                        & active_job_ids
+                    )
+                    if task_job_ids:
+                        print(f"找到当前 manager 提交的 {len(task_job_ids)} 个远程任务作业")
+                        cancelled += runner.cancel_jobs(task_job_ids)
+                        print(f"  已取消 {len(task_job_ids)} 个远程任务作业")
+                finally:
+                    runner.close()
+            except Exception as exc:
+                print(f"远程任务取消失败: {exc}")
         else:
+            result = subprocess.run(
+                "squeue -u $USER -o '%.18i' -h",
+                shell=True,
+                capture_output=True,
+                text=True
+            )
+
+            if result.returncode == 0:
+                active_job_ids = set(result.stdout.strip().split())
+                task_job_ids = [job_id for job_id in candidate_job_ids if job_id in active_job_ids]
+
+            if task_job_ids:
+                print(f"找到当前 manager 提交的 {len(task_job_ids)} 个任务作业")
+                for job_id in task_job_ids:
+                    subprocess.run(f"scancel {job_id}", shell=True)
+                    cancelled += 1
+                print(f"  已取消 {len(task_job_ids)} 个任务作业")
+        if not task_job_ids:
             print("没有找到当前 manager 提交且仍在运行的任务作业")
     else:
         print(f"没有找到当前工作目录的任务映射文件: {jobs_file}")
